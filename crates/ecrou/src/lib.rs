@@ -20,6 +20,16 @@
 //! ([`Error::KvmUnavailable`], [`Error::ArchNotAvailable`]) versus
 //! ordinary failures ([`Error::Other`], which preserves the full context
 //! chain).
+//!
+//! ## Crate split
+//!
+//! `ecrou` is the library and carries no UI: progress flows through
+//! the [`Progress`] sink, engine logging through the `log` facade
+//! filtered by [`LogLevel`], and results come back as typed errors.
+//! `ecrou-cli` owns everything a human sees: flags, the indicatif
+//! rendering of progress events, the log sink, exit codes. A consumer
+//! embeds the library exactly the way the CLI does - a [`RootfsCache`]
+//! to prepare a rootfs, then [`run`] to boot it.
 
 pub mod config;
 pub mod distro;
@@ -36,4 +46,4 @@ pub mod vm;
 pub use error::{Error, Result};
 pub use progress::{NoProgress, Progress, Unit};
 pub use rootfs::{PrepareRequest, PreparedRootfs, RootfsCache};
-pub use vm::{run, RunOptions, Share};
+pub use vm::{run, LogLevel, RunOptions, Share};

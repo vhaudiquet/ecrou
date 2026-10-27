@@ -42,10 +42,23 @@ pub struct RunOptions {
     pub workdir: String,
     pub env: Vec<(String, String)>,
     pub hostname: String,
-    pub quiet: bool,
-    /// More library diagnostics on stderr
-    pub verbose: bool,
+    /// How much of the engine's own logging reaches stderr
+    pub log_level: LogLevel,
     pub no_cache: bool,
+}
+
+/// How much of the engine's own logging reaches stderr. The engine
+/// logs through the `log` facade, so the consumer's sink decides where
+/// lines land; this only picks the filter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogLevel {
+    /// Nothing from the engine; the consumer owns all output.
+    Quiet,
+    /// Warnings and errors. The default.
+    #[default]
+    Normal,
+    /// Engine info as well: lifecycle lines, boot chatter.
+    Verbose,
 }
 
 impl Default for RunOptions {
@@ -60,17 +73,11 @@ impl Default for RunOptions {
             workdir: "/".to_string(),
             env: Vec::new(),
             hostname: String::new(),
-            quiet: false,
-            verbose: false,
+            log_level: LogLevel::Normal,
             no_cache: false,
         }
     }
 }
-
-/// libkrun log levels (0 off, 1 error, 2 warn, 3 info, 4 debug).
-const LOG_LEVEL_WARN: u32 = 2;
-const LOG_LEVEL_INFO: u32 = 3;
-const LOG_LEVEL_QUIET: u32 = 0;
 
 /// Run one machine to completion and return the payload's exit code.
 pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32> {
@@ -122,12 +129,10 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32> {
     );
     let _ = std::fs::remove_file(&exit_file_host);
 
-    krun.set_log_level(if options.quiet {
-        LOG_LEVEL_QUIET
-    } else if options.verbose {
-        LOG_LEVEL_INFO
-    } else {
-        LOG_LEVEL_WARN
+    krun.set_log_level(match options.log_level {
+        LogLevel::Quiet => 0,   // off
+        LogLevel::Normal => 2,  // warn
+        LogLevel::Verbose => 3, // info
     })?;
     let ctx = krun.create_ctx()?;
     krun.set_vm_config(ctx, vcpus, ram_mib)?;
@@ -165,6 +170,15 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32> {
         // Safety: after fork the child runs no threads of its own; the
         // prctl/exit pair has no unwinding preconditions.
         let bail = |msg: String, code: i32| -> ! {
+            // The console file is the channel the parent streams: a
+            // boot failure belongs in it, next to whatever the guest
+            // printed. stderr carries the last-gasp case where the
+            // console was never configured; the child is process
+            // teardown, not library logging.
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&console_path) {
+                let _ = f.write_all(format!("ecrou: {msg}\n").as_bytes());
+            }
             eprintln!("Error: {msg}");
             unsafe { libc::_exit(code) }
         };

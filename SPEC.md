@@ -14,9 +14,17 @@ keep whatever crossed the workspace share, throw the machine away.
 The project is library-first like ecr: `crates/ecrou` is the library
 (package `ecrou`), `crates/ecrou-cli` is the thin front-end (binary
 `ecrou`) that parses flags, maps them onto the library API, and
-propagates exit codes. The library never writes to the terminal:
-diagnostics go through the `log` facade, long operations report through
-the `Progress` sink, all output is the CLI's.
+propagates exit codes. The split is enforced by the dependency edges:
+the library links no clap and no rendering crate. It never writes to
+the terminal: diagnostics go through the `log` facade, filtered by
+`RunOptions::log_level` (an engine-owned enum, not UI booleans), long
+operations report through the `Progress` sink, all output is the
+CLI's. In-process failures come back as typed errors; the one
+exception is the forked machine child's last-gasp diagnostics, which
+land in the console file the parent streams. The CLI owns clap, the
+indicatif rendering of progress events, the log sink, and exit codes.
+A consumer embeds the library exactly the way the CLI does: a
+`RootfsCache` to prepare a rootfs, then `run` to boot it.
 
 The first consumer is rhema's sandbox seam, which shells out to the
 binary the way it shells out to `docker` and `lxc` today. The library

@@ -8,7 +8,7 @@ mod progress;
 
 use clap::Parser;
 use ecrou::vm::RunOptions;
-use ecrou::{NoProgress, Progress};
+use ecrou::{LogLevel, NoProgress, Progress};
 
 use cli::{parse_env, parse_share, Cli, Command, RunArgs};
 use progress::TermProgress;
@@ -28,8 +28,13 @@ fn cmd_run(args: &RunArgs, cli_verbose: bool) -> std::process::ExitCode {
         command: args.command.clone(),
         memory: args.memory.clone(),
         workdir: args.workdir.clone(),
-        quiet: args.quiet,
-        verbose: cli_verbose,
+        log_level: if args.quiet {
+            LogLevel::Quiet
+        } else if cli_verbose {
+            LogLevel::Verbose
+        } else {
+            LogLevel::Normal
+        },
         no_cache: args.no_cache,
         ..RunOptions::default()
     };
