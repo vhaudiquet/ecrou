@@ -26,6 +26,7 @@ pub mod distro;
 pub mod download;
 pub mod error;
 pub mod extract;
+pub mod guest;
 pub mod krun;
 pub mod progress;
 pub mod rootfs;
