@@ -288,12 +288,49 @@ fn extract_prepared(
 
     log::debug!("Extracting to: {}", rootfs.display());
     extract_tarball(&cache_path, &rootfs, progress)?;
+    provision_resolver(&rootfs);
 
     Ok(PreparedRootfs {
         rootfs: temp,
         cache_path,
         arch,
     })
+}
+
+/// Give the guest the host's resolver: the engine proxies guest
+/// sockets to the host's stack, so a nameserver line that works on the
+/// host works in the machine, loopback stub included. Without it the
+/// guest has whatever the image shipped, which is usually nothing.
+/// Best effort: a rootfs with its own resolver config keeps it.
+fn provision_resolver(rootfs: &Path) {
+    let host = match std::fs::read_to_string("/etc/resolv.conf") {
+        Ok(s) if !s.trim().is_empty() => s,
+        Ok(_) => {
+            log::debug!("host /etc/resolv.conf is empty; leaving the image's in place");
+            return;
+        }
+        Err(e) => {
+            log::debug!(
+                "no host /etc/resolv.conf ({}); leaving the image's in place",
+                e
+            );
+            return;
+        }
+    };
+    let target = rootfs.join("etc/resolv.conf");
+    if let Err(e) = std::fs::remove_file(&target) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log::debug!("could not clear {}: {}", target.display(), e);
+            return;
+        }
+    }
+    if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(&target, host) {
+        Ok(()) => log::debug!("provisioned the host resolver into {}", target.display()),
+        Err(e) => log::debug!("could not write {}: {}", target.display(), e),
+    }
 }
 
 /// Write a tarball of `rootfs` at `dest`, compressed according to dest's
