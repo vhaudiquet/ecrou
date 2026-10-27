@@ -138,30 +138,38 @@ host-side; writes through a share land owned by the host user. The
 rootless subuid problem the podman shape has does not exist here.
 
 **The guest init.** A small script provisioned into the scratch rootfs
-before boot, for every run: it mounts each share, applies the hostname,
-cds to the workdir, runs the payload, and writes the exit code to the
-control file. There is no exec (the init must outlive the payload to
+before boot, for every run: it mounts each share, cds to the workdir,
+runs the payload, and writes the exit code to the control file. The
+hostname and workdir ride `krun_set_exec`'s config natively (the init
+blob applies both); the script's own hostname and cd lines stay as
+fallbacks. There is no exec (the init must outlive the payload to
 report it) and no share-less special case: the same contract covers a
-bare shell run. `krun_set_workdir` stays unused; the script owns the
-cwd.
+bare shell run. Ending the machine is not the script's job either:
+when the script exits, the init blob reports the code and the VMM
+powers the machine off (the libkrunfw kernel has no sysrq).
 
-**Exit codes.** The scratch rootfs doubles as the control channel: the
-guest writes its exit code to a file there, and ecrou reads it back
-host-side after the machine powers off. Signal deaths map to
-128+signal, the shell convention the init already produces. If the
-file is absent and the VMM reports a failure, that is an engine error,
-reported as one, never as a guest code. Native propagation through
-`krun_start_enter`'s return value is on the verify list; the file is
-the contract either way, and the mechanism can only get simpler.
+**Exit codes.** On a normal payload exit the VMM terminates its own
+process with the blob-reported code, so `krun_start_enter` never
+returns: run() forks, the child enters the VM loop, and the parent
+reaps it and reads the code from the exit status. Signal deaths map to
+128+signal. The control file remains the diagnostic when the boot dies
+without the init reporting. The mechanism is one hop shorter than
+designed here, and the contract for consumers is unchanged.
 
-**Cancellation is a kill.** The VMM lives in the ecrou process, so a
-killed consumer kills the machine with it. No orphan survives. This is
-stronger than `docker exec`'s cancel, which kills only the local
-client; the tests keep it true (T4).
+**Cancellation is a kill.** The VMM lives in a child of the ecrou
+process carrying PR_SET_PDEATHSIG, so a killed consumer kills the
+machine with it. No orphan survives. This is stronger than `docker
+exec`'s cancel, which kills only the local client; the tests keep it
+true (T4).
 
-**Console.** virtio-console wired to the process's stdio, live lines
-out, stdin through. `krun_set_console_output` is the fallback if the
-default wiring needs redirecting. There is no QEMU monitor to mux;
+**Console.** Guest output reaches real stdout through a console file
+the parent streams while the machine runs, with a final drain after
+the reap. The direct stdio wiring does not survive contact with
+reality: with a tty on fd 0 libkrun's terminal setup stops a
+background caller with SIGTTOU, and without one its console bytes go
+to the log sink, not the terminal. The child therefore unwires fd 0 to
+/dev/null (v1 carries no guest input; a Ctrl-C to the process group is
+still forwarded into the guest). There is no QEMU monitor to mux;
 `--verbose` maps to `krun_set_log_level`.
 
 **Networking.** TSI, libkrun's default: the guest has no interface, and
