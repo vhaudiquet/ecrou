@@ -1,0 +1,45 @@
+[package]
+name = "ecrou"
+description = "One-shot microVM environments on libkrun"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Config parsing
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+# HTTP downloads
+reqwest = { version = "0.13", features = ["blocking", "stream"] }
+
+# Tarball extraction
+tar = "0.4"
+flate2 = "1"
+xz2 = "0.1"
+zstd = "0.13"
+
+# Download integrity: verify content against registry/CDN digests
+sha2 = "0.10"
+
+# Logging facade (the CLI installs the sink)
+log = "0.4"
+
+# Temp directories (the per-run scratch rootfs)
+tempfile = "3"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Utilities
+dirs = "6"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }
+futures-util = "0.3"
+serde_json = "1"
+
+# libkrun FFI: raw ioctl for the KVM probe, runtime dlopen for the ABI
+libc = "0.2"
+libloading = "0.8"

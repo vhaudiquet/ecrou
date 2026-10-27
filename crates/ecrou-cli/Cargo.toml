@@ -1,0 +1,27 @@
+[package]
+name = "ecrou-cli"
+description = "Enter one-shot microVM environments"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ecrou"
+path = "src/main.rs"
+
+[dependencies]
+ecrou = { path = "../ecrou" }
+
+# CLI parsing
+clap = { version = "4", features = ["derive", "env"] }
+
+# Error handling
+anyhow = "1"
+
+# Logging facade; the stderr sink lives in src/logger.rs
+log = { version = "0.4", features = ["std"] }
+
+# Progress bar rendering of library progress events
+indicatif = "0.18"

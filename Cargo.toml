@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/ecrou", "crates/ecrou-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "MIT"
+authors = ["Valentin Haudiquet"]
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
