@@ -137,11 +137,13 @@ requesting guest uid for ownership while storing permission bits
 host-side; writes through a share land owned by the host user. The
 rootless subuid problem the podman shape has does not exist here.
 
-**The guest init.** When shares exist, the payload is a small script
-provisioned into the scratch rootfs before boot: it mounts each share,
-`cd`s nowhere (the workdir rides `krun_set_workdir` natively), execs
-the real payload, and writes its exit code to the control file. With no
-shares, the payload execs directly.
+**The guest init.** A small script provisioned into the scratch rootfs
+before boot, for every run: it mounts each share, applies the hostname,
+cds to the workdir, runs the payload, and writes the exit code to the
+control file. There is no exec (the init must outlive the payload to
+report it) and no share-less special case: the same contract covers a
+bare shell run. `krun_set_workdir` stays unused; the script owns the
+cwd.
 
 **Exit codes.** The scratch rootfs doubles as the control channel: the
 guest writes its exit code to a file there, and ecrou reads it back
