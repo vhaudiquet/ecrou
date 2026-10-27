@@ -281,6 +281,21 @@ roughly 6 MB combined they cost less than any qemu-system package, and
 the kernel ships inside libkrunfw, so there is nothing else to fetch or
 stage.
 
+Where the libraries come from, as of now: no Ubuntu release publishes
+a `libkrun.so.1` package at all, and libkrunfw5 exists only in the
+current development series' universe, not in any LTS the snap bases
+ship from. Debian sid has both (source package `libkrun`), so the gap
+is sync lag and it should close by the next LTS. Until then the snap
+carries both halves itself: a part that builds libkrun from source
+(the recipe is small: rust, clang for the C shim, `make build-release`
+with the net feature for TSI) and stages `libkrun.so.1`; and a part
+that fetches the `libkrunfw5` .deb from the Ubuntu pool and unpacks it
+into the staging tree. snapcraft puts staged libraries on
+`LD_LIBRARY_PATH` at runtime, which is exactly the resolution path the
+`dlopen` in krun.rs takes; there is no ldconfig and no host dependency.
+When an LTS base archive ships both packages, both parts shrink to
+`stage-packages` entries and the from-source build is deleted.
+
 The first milestone is the spike snap, before any porting: a minimal
 libkrun binary behind strict confinement running a VM. T1 is the gate
 that proves the shape under real AppArmor and seccomp, and everything
