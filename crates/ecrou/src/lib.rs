@@ -31,7 +31,9 @@ pub mod krun;
 pub mod progress;
 pub mod rootfs;
 pub mod utils;
+pub mod vm;
 
 pub use error::{Error, Result};
 pub use progress::{NoProgress, Progress, Unit};
 pub use rootfs::{PrepareRequest, PreparedRootfs, RootfsCache};
+pub use vm::{run, RunOptions, Share};
