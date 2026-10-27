@@ -1,8 +1,9 @@
 //! The guest init: a script provisioned into the scratch rootfs before
-//! boot. It mounts the virtiofs shares, runs the payload, writes the
-//! payload's exit code to the control file the host reads back, and
-//! powers the machine off. As PID 1 it is deliberately the only thing
-//! that runs; there is no guest agent.
+//! boot. It mounts the virtiofs shares, runs the payload, and writes
+//! the payload's exit code to the control file. The exit itself ends
+//! the machine: libkrun's init blob reaps the script, reports the code,
+//! and the VMM terminates the host process with it. This script is
+//! deliberately the only thing that runs; there is no guest agent.
 
 /// A share as the init sees it: a virtiofs tag to mount at a guest path.
 #[derive(Debug, Clone, PartialEq)]
@@ -80,10 +81,12 @@ pub fn init_script(
     }
     script.push_str("\n\ncode=$?\n");
     script.push_str(&format!("echo \"$code\" > {}\n", sh_quote(EXIT_FILE)));
-    // sysrq poweroff: works without a poweroff binary in the rootfs. If
-    // sysrq is disabled the machine lingers and the consumer's kill
-    // (T4) is the backstop.
-    script.push_str("echo o > /proc/sysrq-trigger\nexit \"$code\"\n");
+    // When this script exits, the guest init blob reaps it, reports the
+    // exit code to the VMM, and the VMM ends the host process with it:
+    // no poweroff helper is needed in the rootfs. The control file write
+    // above must precede this line; it is the diagnostic when the boot
+    // dies before the init ran.
+    script.push_str("exit \"$code\"\n");
     script
 }
 
@@ -136,13 +139,19 @@ mod tests {
     }
 
     #[test]
-    fn writes_exit_code_and_powers_off() {
+    fn writes_exit_code_then_exits() {
         let script = init_script(&[], &["true".to_string()], "/work", "ecrou-vm-x");
         assert!(script.contains(&format!("echo \"$code\" > '{}'", EXIT_FILE)));
-        assert!(script.contains("echo o > /proc/sysrq-trigger"));
-        assert!(script.contains("exit \"$code\""));
+        // The file write must precede the exit: it is the only
+        // diagnostic when a boot dies without the init running.
+        let write = script.find("echo \"$code\"").unwrap();
+        let exit = script.find("exit \"$code\"").unwrap();
+        assert!(write < exit);
         // No exec of the payload: the init must survive it to report.
         assert!(!script.contains("exec "));
+        // The libkrunfw kernel has no sysrq; ending the machine is the
+        // init blob's job when this script exits.
+        assert!(!script.contains("sysrq"));
     }
 
     #[test]

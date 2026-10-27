@@ -43,6 +43,8 @@ pub struct RunOptions {
     pub env: Vec<(String, String)>,
     pub hostname: String,
     pub quiet: bool,
+    /// More library diagnostics on stderr
+    pub verbose: bool,
     pub no_cache: bool,
 }
 
@@ -59,14 +61,16 @@ impl Default for RunOptions {
             env: Vec::new(),
             hostname: String::new(),
             quiet: false,
+            verbose: false,
             no_cache: false,
         }
     }
 }
 
 /// libkrun log levels (0 off, 1 error, 2 warn, 3 info, 4 debug).
+const LOG_LEVEL_WARN: u32 = 2;
 const LOG_LEVEL_INFO: u32 = 3;
-const LOG_LEVEL_QUIET: u32 = 1;
+const LOG_LEVEL_QUIET: u32 = 0;
 
 /// Run one machine to completion and return the payload's exit code.
 pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32> {
@@ -100,7 +104,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32> {
         .map(|(_, gs)| gs.clone())
         .collect::<Vec<_>>();
     let payload = payload_command(options, rootfs.dir());
-    let env = compose_env(rootfs.dir(), options);
+    let env = compose_env(rootfs.dir(), options, &hostname);
 
     // The guest init is generated for every run: it is the exit-code
     // contract (it writes the control file), the share mounter, and the
@@ -120,8 +124,10 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32> {
 
     krun.set_log_level(if options.quiet {
         LOG_LEVEL_QUIET
-    } else {
+    } else if options.verbose {
         LOG_LEVEL_INFO
+    } else {
+        LOG_LEVEL_WARN
     })?;
     let ctx = krun.create_ctx()?;
     krun.set_vm_config(ctx, vcpus, ram_mib)?;
@@ -129,8 +135,11 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32> {
     for (share, gs) in &share_pairs {
         krun.add_virtiofs(ctx, &gs.tag, &share.host)?;
     }
-    // The init script owns the workdir (it cds before the payload), so
-    // the native krun_set_workdir stays unused.
+    // The blob chdirs from KRUN_WORKDIR before exec; the script's cd
+    // stays as the fallback path.
+    if !options.workdir.is_empty() && options.workdir != "/" {
+        krun.set_workdir(ctx, &options.workdir)?;
+    }
     krun.set_exec(
         ctx,
         "/ecrou-init",
@@ -140,20 +149,172 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32> {
             .collect::<Vec<_>>(),
     )?;
 
-    // Blocks until the guest powers off; the machine dies with this
-    // process if the consumer kills us first.
-    krun.start_enter(ctx)?;
+    // The console goes through a file we stream to real stdout: without
+    // a tty, libkrun would route guest output through its logger, and
+    // with one, its terminal setup stops a background process with
+    // SIGTTOU. A killed parent kills the machine through PDEATHSIG.
+    let console_path = rootfs.dir().join(".ecrou-console");
+    std::fs::File::create(&console_path)
+        .with_context(|| format!("creating {}", console_path.display()))?;
 
-    let code = std::fs::read_to_string(&exit_file_host)
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        .ok_or_else(|| {
-            Error::Other(anyhow!(
-                "the guest did not report an exit code through {}; the machine \
-                 failed to boot or the init did not run to completion",
-                guest::EXIT_FILE
-            ))
-        })?;
+    // Fork with no other threads alive: the child only touches libkrun
+    // configuration before entering the VM loop, which never returns (a
+    // normal payload exit ends the child through the VMM's own exit).
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        // Safety: after fork the child runs no threads of its own; the
+        // prctl/exit pair has no unwinding preconditions.
+        let bail = |msg: String, code: i32| -> ! {
+            eprintln!("Error: {msg}");
+            unsafe { libc::_exit(code) }
+        };
+        unsafe {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            // Unwire the console input: with a tty on fd 0 libkrun puts
+            // that terminal into raw mode, which fights whoever owns it
+            // (and stops a background caller with SIGTTOU). /dev/null
+            // keeps the console on its plain path and still forwards a
+            // Ctrl-C sent to the process group into the guest.
+            let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+            if null >= 0 {
+                libc::dup2(null, libc::STDIN_FILENO);
+                if null != libc::STDIN_FILENO {
+                    libc::close(null);
+                }
+            }
+            libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        }
+        if let Err(err) = krun.set_console_output(ctx, &console_path) {
+            bail(format!("{err:#}"), 125);
+        }
+        if let Err(err) = krun.start_enter(ctx) {
+            bail(format!("{err:#}"), 125);
+        }
+        bail("start_enter returned".to_string(), 125);
+    }
+    if child < 0 {
+        return Err(Error::Other(
+            anyhow::Error::from(std::io::Error::last_os_error())
+                .context("forking the machine process"),
+        ));
+    }
+
+    let reaped = std::sync::atomic::AtomicI32::new(-1);
+    stream_console(&console_path, child, &reaped)?;
+    wait_machine(child, &reaped, &exit_file_host)
+}
+
+/// Relay the console file to real stdout while the machine runs, so
+/// output appears as the guest produces it.
+fn stream_console(
+    console_path: &Path,
+    child: libc::pid_t,
+    reaped: &std::sync::atomic::AtomicI32,
+) -> Result<()> {
+    use std::io::{Read, Seek, Write};
+    let mut pos: u64 = 0;
+    let mut done = false;
+    while !done {
+        let len = std::fs::metadata(console_path)
+            .with_context(|| format!("stat {}", console_path.display()))?
+            .len();
+        if len > pos {
+            let mut file = std::fs::File::open(console_path)
+                .with_context(|| format!("opening {}", console_path.display()))?;
+            file.seek(std::io::SeekFrom::Start(pos))
+                .with_context(|| format!("seeking {}", console_path.display()))?;
+            let mut buf = Vec::with_capacity((len - pos) as usize);
+            file.read_to_end(&mut buf)
+                .with_context(|| format!("reading {}", console_path.display()))?;
+            pos += buf.len() as u64;
+            let mut out = std::io::stdout().lock();
+            out.write_all(&buf).context("writing console output")?;
+            out.flush().ok();
+        }
+        // Reap-if-exited: the raw status lands in `reaped` for the
+        // collector below. WNOWAIT is waitid-only; plain WNOHANG here
+        // both reports and reaps.
+        let mut status: libc::c_int = 0;
+        // Safety: waitpid with WNOHANG only; the pid is our own child.
+        let r = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+        if r == child {
+            reaped.store(status, std::sync::atomic::Ordering::SeqCst);
+            done = true;
+        } else if r < 0 {
+            return Err(Error::Other(
+                anyhow::Error::from(std::io::Error::last_os_error())
+                    .context("waiting for the machine process"),
+            ));
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    // The machine's last console bytes land in the file right before it
+    // dies; drain once more past the final metadata check above.
+    let len = std::fs::metadata(console_path)
+        .with_context(|| format!("stat {}", console_path.display()))?
+        .len();
+    if len > pos {
+        let mut file = std::fs::File::open(console_path)
+            .with_context(|| format!("opening {}", console_path.display()))?;
+        file.seek(std::io::SeekFrom::Start(pos))
+            .with_context(|| format!("seeking {}", console_path.display()))?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)
+            .with_context(|| format!("reading {}", console_path.display()))?;
+        let mut out = std::io::stdout().lock();
+        out.write_all(&buf).context("writing console output")?;
+        out.flush().ok();
+    }
+    Ok(())
+}
+
+/// Collect the machine: its exit status is the payload's exit code (the
+/// guest init blob reports it and the VMM exits the child with it).
+fn wait_machine(
+    child: libc::pid_t,
+    reaped: &std::sync::atomic::AtomicI32,
+    exit_file_host: &Path,
+) -> Result<i32> {
+    let reaped_status = reaped.load(std::sync::atomic::Ordering::SeqCst);
+    if reaped_status >= 0 {
+        return decode_status(reaped_status, exit_file_host);
+    }
+    let mut status: libc::c_int = 0;
+    // Safety: waitpid on our own child; the pointer points at valid
+    // storage.
+    let ret = unsafe { libc::waitpid(child, &mut status, 0) };
+    if ret < 0 {
+        return Err(Error::Other(
+            anyhow::Error::from(std::io::Error::last_os_error())
+                .context("waiting for the machine process"),
+        ));
+    }
+    decode_status(status, exit_file_host)
+}
+
+fn decode_status(status: libc::c_int, exit_file_host: &Path) -> Result<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    let code = if let Some(sig) = std::process::ExitStatus::from_raw(status).signal() {
+        128 + sig
+    } else {
+        std::process::ExitStatus::from_raw(status)
+            .code()
+            .unwrap_or(125)
+    };
+    if code == 125 {
+        // Boot failure: the init blob never reported a code. The
+        // control file is the diagnostic when it ran partway.
+        if let Ok(s) = std::fs::read_to_string(exit_file_host) {
+            if let Ok(c) = s.trim().parse::<i32>() {
+                return Ok(c);
+            }
+        }
+        return Err(Error::Other(anyhow!(
+            "the machine failed to boot; run with --quiet off and check the \
+             console output above"
+        )));
+    }
     Ok(code)
 }
 
@@ -210,7 +371,7 @@ fn payload_command(options: &RunOptions, rootfs_dir: &Path) -> Vec<String> {
 /// The guest environment, composed from scratch: a usable base, the
 /// workspace mount point, and the caller's pairs. Never the host
 /// environment.
-fn compose_env(rootfs_dir: &Path, options: &RunOptions) -> Vec<(String, String)> {
+fn compose_env(rootfs_dir: &Path, options: &RunOptions, hostname: &str) -> Vec<(String, String)> {
     let host_term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
     let mut env = vec![
         ("HOME".to_string(), "/root".to_string()),
@@ -220,6 +381,7 @@ fn compose_env(rootfs_dir: &Path, options: &RunOptions) -> Vec<(String, String)>
             utils::detect_shell(rootfs_dir).to_string(),
         ),
         ("TERM".to_string(), host_term),
+        ("HOSTNAME".to_string(), hostname.to_string()),
         (
             "PATH".to_string(),
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
@@ -323,7 +485,7 @@ mod tests {
         options
             .env
             .push(("ECROU_TEST_MARK".to_string(), "present".to_string()));
-        let env = compose_env(&dir, &options);
+        let env = compose_env(&dir, &options, "ecrou-vm-x");
         assert!(env
             .iter()
             .any(|(k, v)| k == "ECROU_TEST_MARK" && v == "present"));

@@ -17,17 +17,19 @@ fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     logger::init(cli.verbose);
     match cli.command {
-        Command::Run(args) => cmd_run(&args),
+        Command::Run(args) => cmd_run(&args, cli.verbose),
         Command::Probe => cmd_probe(),
     }
 }
 
-fn cmd_run(args: &RunArgs) -> std::process::ExitCode {
+fn cmd_run(args: &RunArgs, cli_verbose: bool) -> std::process::ExitCode {
     let mut options = RunOptions {
         image: args.image.clone(),
+        command: args.command.clone(),
         memory: args.memory.clone(),
         workdir: args.workdir.clone(),
         quiet: args.quiet,
+        verbose: cli_verbose,
         no_cache: args.no_cache,
         ..RunOptions::default()
     };
