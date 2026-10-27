@@ -27,7 +27,12 @@ pub fn sh_quote(s: &str) -> String {
 /// Render the guest init. The payload runs as a child (never `exec`):
 /// the init must outlive it to write the exit code and power the
 /// machine off.
-pub fn init_script(shares: &[GuestShare], payload: &[String], workdir: &str) -> String {
+pub fn init_script(
+    shares: &[GuestShare],
+    payload: &[String],
+    workdir: &str,
+    hostname: &str,
+) -> String {
     let mut script = String::from(
         "#!/bin/sh\n\
          # ecrou guest init: mount the shares, run the payload, report its\n\
@@ -54,8 +59,18 @@ pub fn init_script(shares: &[GuestShare], payload: &[String], workdir: &str) -> 
         ));
     }
 
+    // Best effort: some rootfs trees ship their own /etc/hostname.
     script.push_str(&format!(
-        "\ncd {} || exit 126\n\n",
+        "echo {} > /proc/sys/kernel/hostname 2>/dev/null || true\n",
+        sh_quote(hostname)
+    ));
+    script.push_str(&format!(
+        "echo {} > /etc/hostname 2>/dev/null || true\n\n",
+        sh_quote(hostname)
+    ));
+
+    script.push_str(&format!(
+        "cd {} || exit 126\n\n",
         sh_quote(if workdir.is_empty() { "/" } else { workdir })
     ));
 
@@ -98,7 +113,7 @@ mod tests {
                 read_only: true,
             },
         ];
-        let script = init_script(&shares, &["true".to_string()], "/");
+        let script = init_script(&shares, &["true".to_string()], "/", "ecrou-vm-x");
         assert!(script.contains("mount_share 'ws0' '/workspace' 'rw'"));
         assert!(script.contains("mount_share 'sk1' '/mnt/skills' 'ro'"));
     }
@@ -110,7 +125,7 @@ mod tests {
             "-c".to_string(),
             "echo $HOME; rm -rf '/'".to_string(),
         ];
-        let script = init_script(&[], &payload, "/");
+        let script = init_script(&[], &payload, "/", "ecrou-vm-x");
         assert!(script.contains(r"'/bin/bash' '-c' 'echo $HOME; rm -rf '\''/'\''' "));
         // The payload line must appear after the cd and before the code
         // capture, so its exit code is what gets written.
@@ -122,7 +137,7 @@ mod tests {
 
     #[test]
     fn writes_exit_code_and_powers_off() {
-        let script = init_script(&[], &["true".to_string()], "/work");
+        let script = init_script(&[], &["true".to_string()], "/work", "ecrou-vm-x");
         assert!(script.contains(&format!("echo \"$code\" > '{}'", EXIT_FILE)));
         assert!(script.contains("echo o > /proc/sysrq-trigger"));
         assert!(script.contains("exit \"$code\""));
@@ -131,8 +146,15 @@ mod tests {
     }
 
     #[test]
+    fn hostname_lands_in_proc_and_etc() {
+        let script = init_script(&[], &["true".to_string()], "/", "ecrou-vm-x");
+        assert!(script.contains("echo 'ecrou-vm-x' > /proc/sys/kernel/hostname"));
+        assert!(script.contains("echo 'ecrou-vm-x' > /etc/hostname"));
+    }
+
+    #[test]
     fn empty_workdir_falls_back_to_root() {
-        let script = init_script(&[], &["true".to_string()], "");
+        let script = init_script(&[], &["true".to_string()], "", "ecrou-vm-x");
         assert!(script.contains("cd '/'"));
     }
 }
