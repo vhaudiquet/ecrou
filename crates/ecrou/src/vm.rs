@@ -362,10 +362,19 @@ fn collect_shares(
 
 /// The guest payload: the caller's argv, or the rootfs's default shell.
 fn payload_command(options: &RunOptions, rootfs_dir: &Path) -> Vec<String> {
-    if !options.command.is_empty() {
-        return options.command.clone();
+    let shell = utils::detect_shell(rootfs_dir).to_string();
+    match options.command.as_slice() {
+        // No command: the image's shell.
+        [] => vec![shell],
+        // One quoted shell line: `ecrou run alpine -- "apk add x && y"`.
+        // The whole line would otherwise be execvp'd as one program
+        // name; the consumer clearly asked for a shell line.
+        [line] if line.contains(char::is_whitespace) => {
+            vec![shell, "-c".to_string(), line.clone()]
+        }
+        // An argv vector, taken literally.
+        cmd => cmd.to_vec(),
     }
-    vec![utils::detect_shell(rootfs_dir).to_string()]
 }
 
 /// The guest environment, composed from scratch: a usable base, the
@@ -446,6 +455,64 @@ fn parse_memory_mib(s: &str) -> anyhow::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scratch with just a shell, for payload_command tests.
+    fn shell_rootfs() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        std::fs::write(dir.path().join("bin/sh"), "").unwrap();
+        dir
+    }
+
+    #[test]
+    fn payload_defaults_to_the_image_shell() {
+        let rootfs = shell_rootfs();
+        let options = RunOptions::default();
+        assert_eq!(
+            payload_command(&options, rootfs.path()),
+            vec!["/bin/sh".to_string()]
+        );
+    }
+
+    #[test]
+    fn payload_argv_is_taken_literally() {
+        let rootfs = shell_rootfs();
+        let options = RunOptions {
+            command: vec!["uname".to_string(), "-a".to_string()],
+            ..RunOptions::default()
+        };
+        assert_eq!(
+            payload_command(&options, rootfs.path()),
+            vec!["uname".to_string(), "-a".to_string()]
+        );
+        // Even when it looks like a shell invocation: the consumer
+        // asked for argv.
+        let options = RunOptions {
+            command: vec!["sh".to_string(), "-c".to_string(), "exit 7".to_string()],
+            ..RunOptions::default()
+        };
+        assert_eq!(
+            payload_command(&options, rootfs.path()),
+            vec!["sh".to_string(), "-c".to_string(), "exit 7".to_string()]
+        );
+    }
+
+    #[test]
+    fn payload_single_quoted_line_runs_through_the_shell() {
+        let rootfs = shell_rootfs();
+        let options = RunOptions {
+            command: vec!["apk add fastfetch && fastfetch".to_string()],
+            ..RunOptions::default()
+        };
+        assert_eq!(
+            payload_command(&options, rootfs.path()),
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "apk add fastfetch && fastfetch".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn memory_parses_to_whole_mib() {

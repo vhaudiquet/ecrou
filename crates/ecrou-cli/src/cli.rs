@@ -29,7 +29,9 @@ pub enum Command {
 pub struct RunArgs {
     /// Distribution name or OCI image reference
     pub image: String,
-    /// Command to run in the machine; the image's default shell when omitted
+    /// Command to run in the machine; the image's default shell when
+    /// omitted. An argument vector after `--` is taken literally; a
+    /// single quoted line runs through the image's shell.
     #[arg(last = true)]
     pub command: Vec<String>,
     /// Directory to share into the machine as HOST:GUEST[:ro] (repeatable)

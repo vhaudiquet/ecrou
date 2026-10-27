@@ -144,7 +144,11 @@ hostname and workdir ride `krun_set_exec`'s config natively (the init
 blob applies both); the script's own hostname and cd lines stay as
 fallbacks. There is no exec (the init must outlive the payload to
 report it) and no share-less special case: the same contract covers a
-bare shell run. Ending the machine is not the script's job either:
+bare shell run. The payload itself is an argv vector taken
+literally; the one rewrite is a single argument containing whitespace,
+which is a quoted shell line ("apk add x && y") and runs through the
+image's shell as `sh -c`. Ending the machine is not the script's job
+either:
 when the script exits, the init blob reports the code and the VMM
 powers the machine off (the libkrunfw kernel has no sysrq).
 
@@ -223,12 +227,13 @@ pub struct RunOptions {
     pub workdir: String,        // guest cwd; empty = /
     pub env: Vec<(String, String)>, // composed envp; host env never inherited
     pub hostname: String,       // empty = generated ecrou-vm-XXXXXX
-    pub quiet: bool,
+    pub log_level: LogLevel,    // Quiet | Normal | Verbose
 }
 pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32>
 ```
 
-stdio is inherited; the return value is the guest exit code. A run
+Guest output reaches real stdout through the streamed console; the
+return value is the guest exit code. A run
 without working KVM is `Error::KvmUnavailable` with the remediation
 text. Everything else is `Error::Other` over the anyhow chain, ecr's
 shape. The v1 API has no captured-output variant and no long-lived
