@@ -7,16 +7,16 @@ from ecr, the ephemeral chroot: the name keeps the ancestor, and the
 answer to "chroot ou VM" is now VM. As a bonus, an écrou is a nut: the
 small part that keeps a bolt from walking out of the wall.
 
-One sentence: resolve an image reference, boot it as a one-shot microVM,
-run one command with live stdio, propagate its exit code, keep whatever
-crossed the workspace share, throw the machine away.
+One sentence: resolve an image reference, boot it as a one-shot microVM
+on libkrun, run one command with live stdio, propagate its exit code,
+keep whatever crossed the workspace share, throw the machine away.
 
 The project is library-first like ecr: `crates/ecrou` is the library
-(package `ecrou`), `crates/ecr-cli` becomes `crates/ecrou-cli` (binary
-`ecrou`), a thin front-end that parses flags, maps them onto the library
-API, and propagates exit codes. The library never writes to the
-terminal: diagnostics go through the `log` facade, long operations
-report through the `Progress` sink, all output is the CLI's.
+(package `ecrou`), `crates/ecrou-cli` is the thin front-end (binary
+`ecrou`) that parses flags, maps them onto the library API, and
+propagates exit codes. The library never writes to the terminal:
+diagnostics go through the `log` facade, long operations report through
+the `Progress` sink, all output is the CLI's.
 
 The first consumer is rhema's sandbox seam, which shells out to the
 binary the way it shells out to `docker` and `lxc` today. The library
@@ -28,12 +28,47 @@ runtime.
 | module | disposition |
 |---|---|
 | `distro`, `download`, `extract`, `rootfs`, `utils`, `progress` | ported; the image machinery is confinement-neutral plain fs and network |
-| `qemu_vm` (cpio builder, KVM probe, launch) | ported and grown; becomes `initramfs` + `qemu` + `vm` |
-| `kernel` | ported; Alpine `linux-virt` fetch, cache entry renamed |
+| `kernel` | dropped; the kernel is libkrun's, bundled in libkrunfw |
+| `qemu_vm` | dropped from v1; its KVM probe logic (open `/dev/kvm`, `KVM_GET_API_VERSION` == 12) moves into the `krun` module |
 | `namespace`, `chroot`, `mount`, `exec` | dropped; they stay in ecr, their ancestor. Their error variants (`UserNamespacesUnavailable`, `BinfmtNotRegistered`, `MissingSubidRange`) leave with them |
+
+No initramfs and no cpio builder: the rootfs crosses as a virtiofs
+share, never as a packed archive.
 
 No cache compatibility with ecr: the formats may match but the directory
 is `~/.cache/ecrou` and never shared.
+
+## The engine: libkrun
+
+v1 has exactly one engine, libkrun, driven through its stable C ABI
+(the `stable-1.19.x` headers; the main branch is mid-rewrite to a
+vtable API and is not the target). ecrou `dlopen`s `libkrun.so.1` at
+runtime and fails with a remediation message naming the install when it
+is missing; nothing links at build time, and a snap bundles the library
+plus libkrunfw next to itself.
+
+The VMM runs inside the ecrou process: `krun_start_enter` enters the
+VM loop on the calling thread. There is no child process to shepherd,
+which makes the kill contract below trivial.
+
+The FFI lives in `crates/ecrou/src/krun.rs`. ecrou carries unsafe libc
+code; rhema, its first consumer, keeps `#![forbid(unsafe_code)]` and
+drives the CLI.
+
+The v1 API surface is eleven calls: `krun_set_log_level`,
+`krun_create_ctx`, `krun_set_vm_config`, `krun_set_root`,
+`krun_add_virtiofs`, `krun_set_workdir`, `krun_set_exec`,
+`krun_set_env`, `krun_set_console_output`, `krun_start_enter`,
+`krun_check_nested_virt`. `krun_set_mapped_volumes` exists but is
+explicitly unsupported on Linux (its header says to use user namespaces
+and bind-mounts instead, which is precisely what ecrou cannot do); the
+workspace is a tagged `krun_add_virtiofs` share mounted by the guest
+init instead.
+
+KVM is required. There is no TCG fallback; a machine without working
+KVM is an `Error::KvmUnavailable` with the remediation text, and
+`ecrou probe` reports it before any run. QEMU as a fallback engine is a
+Later row, and its arrival would not change the API.
 
 ## The founding rule
 
@@ -55,101 +90,96 @@ beyond what the shares expose.
 
 Everything the host process may do, and nothing else:
 
-- fs: read, write, stat, rename, unlink, mkdir under the cache directory
-  and the share roots it was given, plus its own private tmpdir
-- exec: the kernel it boots and `qemu-system-*` (later: libkrun), found
-  in PATH or staged in the snap
-- `/dev/kvm`: open, ioctl, mmap. Optional; TCG is the fallback when the
-  probe finds no working KVM (`KVM_GET_API_VERSION` != 12)
-- net: TCP and UDP client sockets for registry fetches, slirp's host
-  side, and localhost listeners only through explicit `hostfwd`
-- process: fork, exec, waitpid, and signals for its own children
+- fs: read, write, stat, rename, unlink, mkdir, fallocate under the
+  cache directory and the share roots it was given, plus the scratch
+  rootfs TempDir
+- exec: itself; libraries via `dlopen` (`libkrun.so.1`, libkrunfw)
+- `/dev/kvm`: open, ioctl, mmap
+- net: TCP and UDP client sockets; with TSI these carry the guest's
+  connections too, proxied host-side
+- process: threads, futexes, eventfds, timers; no children in v1
 
 Denied by design: `mount`, `umount2`, `unshare`, `setns`, `pivot_root`,
 `open_tree`, `move_mount`, `mount_setattr`, `fsopen`, `fsmount`,
 `ptrace`, kernel module loading, keyring calls. All absent from snapd's
 seccomp allowlist, which is where the allowed list above is drawn from.
-Host `mknod` is allowlisted but AppArmor mediates what it can create;
-ecrou has no use for it either way.
+Two absences need a spike-time check because VMMs plausibly touch them:
+`sched_setaffinity` and `openat2`. The spike straces for EPERM on
+allowed-looking calls, and anything libkrun genuinely needs that the
+allowlist denies goes on a snapd issue, never into a workaround.
 
 ## Execution model
 
-One-shot machines. `ecrou run IMAGE -- CMD` boots one VM whose init
-execs CMD as the only workload; when CMD exits, the machine powers off.
-There is no exec into a running machine. No engine in the family has
-that API: libkrun's `krun_set_exec` is per-context before start, and
-crun's krun handler boots a fresh VM for every `crun exec`. A guest
-agent and long-lived machines are a later row; per-command boots are the
-v1 shape, and the boot budget below is what keeps them honest.
+One-shot machines. `ecrou run IMAGE -- CMD` prepares a rootfs, boots
+one VM whose payload is CMD, streams its stdio, and exits with CMD's
+code when the machine powers off. There is no exec into a running
+machine. No engine in the family has that API: `krun_set_exec` is
+per-context before start, and crun's krun handler boots a fresh VM for
+every `crun exec`. A guest agent and long-lived machines are a Later
+row; per-command boots are the v1 shape, and the boot budget below is
+what keeps them honest.
 
-Ephemeral rootfs, durable workspace. The base system is an initramfs:
-it exists only in RAM and dies with the machine. Persistence crosses a
-workspace share or it does not happen.
+Ephemeral rootfs, durable workspace. The base system is a scratch copy
+of the image (a `PreparedRootfs`, TempDir-backed): it exists only for
+the run and dies with it. Persistence crosses a workspace share or it
+does not happen.
 
-**Workspace shares.** `--share HOST:GUEST[:ro]`, served by 9p
-(`qemu -virtfs local`). The host side is plain fs under one more
-directory the budget covers; the guest init mounts it. There is no
-implicit share: an empty sandbox is the default, and the consumer
-chooses what crosses. This is deliberate; a sandbox runtime does not
-silently attach the caller's cwd.
+**Workspace shares.** `--share HOST:GUEST[:ro]`, one virtiofs share per
+entry (`krun_add_virtiofs`, `krun_set_root` keeps the rootfs itself).
+The host side is plain fs; the guest init mounts each share at its
+guest path. There is no implicit share: an empty sandbox is the
+default, and the consumer chooses what crosses. This is deliberate; a
+sandbox runtime does not silently attach the caller's cwd.
 
-**Exit codes.** The machine has a private control share: a host tmpdir
-the API does not surface, mounted read-write at a fixed guest path. The
-init writes CMD's exit code to a file there, then powers off; ecrou
-reads it back and exits with it. Signal deaths map to 128+signal, the
-shell convention the init already produces. Alternatives considered and
-rejected for v1: isa-debug-exit (x86-only, awkward from a shell init)
-and semihosting exit (arch-dependent). If the exit file is absent and
-QEMU itself failed, that is an engine failure, reported as one, never as
-a guest code.
+Ownership needs no mapping layer. The guest runs as root inside its own
+kernel, and libkrun's simplified virtiofs semantics report the
+requesting guest uid for ownership while storing permission bits
+host-side; writes through a share land owned by the host user. The
+rootless subuid problem the podman shape has does not exist here.
 
-**Cancellation is a kill.** ecrou-cli spawns QEMU with
-`PR_SET_PDEATHSIG` and a kill-on-drop guard, so a killed consumer kills
-the machine. No orphan QEMU survives the CLI. This is stronger than
-`docker exec`'s cancel, which kills only the local client; the tests
-keep it true (T4).
+**The guest init.** When shares exist, the payload is a small script
+provisioned into the scratch rootfs before boot: it mounts each share,
+`cd`s nowhere (the workdir rides `krun_set_workdir` natively), execs
+the real payload, and writes its exit code to the control file. With no
+shares, the payload execs directly.
 
-**Console.** `-serial stdio`, no monitor mux. The QEMU monitor is a
-host-level control hatch over the machine; a sandbox runtime does not
-mux it into the workload's stdio by accident. `--monitor` restores
-`mon:stdio` for development.
+**Exit codes.** The scratch rootfs doubles as the control channel: the
+guest writes its exit code to a file there, and ecrou reads it back
+host-side after the machine powers off. Signal deaths map to
+128+signal, the shell convention the init already produces. If the
+file is absent and the VMM reports a failure, that is an engine error,
+reported as one, never as a guest code. Native propagation through
+`krun_start_enter`'s return value is on the verify list; the file is
+the contract either way, and the mechanism can only get simpler.
 
-**Networking.** slirp user-mode only. The init configures the guest
-statically (10.0.2.15/24, gateway 10.0.2.2, DNS 10.0.2.3); no DHCP
-client is assumed. No tap, no bridges, ever: they need host setup the
-budget cannot afford. `hostfwd` stays available for a later
-sandboxd-in-guest.
+**Cancellation is a kill.** The VMM lives in the ecrou process, so a
+killed consumer kills the machine with it. No orphan survives. This is
+stronger than `docker exec`'s cancel, which kills only the local
+client; the tests keep it true (T4).
 
-**Env and argv** ride the kernel command line base64-encoded, ecr's
-trick, extended to the environment. Sane size is a few KB; oversized
-payloads are a caller bug and fail loudly.
+**Console.** virtio-console wired to the process's stdio, live lines
+out, stdin through. `krun_set_console_output` is the fallback if the
+default wiring needs redirecting. There is no QEMU monitor to mux;
+`--verbose` maps to `krun_set_log_level`.
 
-**Memory.** Default 1G, `-m` to override. ecr's CLI defaulted 2G; a
-per-command machine is provisioned per command, and agent consumers run
-several concurrently.
+**Networking.** TSI, libkrun's default: the guest has no interface, and
+its socket calls are proxied on the host's stack by the VMM process.
+DNS is proxied with them (verified in T7, including the resolver file
+the guest needs). Port publishing (`krun_set_port_map`) is how a later
+sandboxd-in-guest serves the host. No tap, no bridges, ever: they need
+host setup the budget cannot afford.
 
-## The guest side
-
-The init is ours, a generated shell script packed into the initramfs and
-selected with `rdinit=`. It grows from ecr's (hostname, shell detection,
-argv decode, sysrq poweroff fallback) with static net config, share
-mounts, the workdir `cd`, and the exit-code handshake added. It uses
-only what the image ships; `busybox` is not assumed.
-
-Kernel: Alpine `linux-virt` per target arch (the `linux-lts` fallback
-when no virt flavor exists), fetched and cached as today. The pack step
-adds the booted kernel's `/lib/modules` tree into the initramfs: 9p and
-virtio_net are modules in `linux-virt`, and the distro image's module
-tree does not match the kernel we boot. The size cost is measured in
-T5, and gzip compression of the initramfs is the knob if it hurts.
+**Memory and CPUs.** `krun_set_vm_config`; default 1G and
+all-logical-cpus, `-m` to override. A per-command machine is
+provisioned per command, and agent consumers run several concurrently.
 
 ## Workspace layout
 
 Cargo workspace, two crates, the ecr split:
 
 - `crates/ecrou` - the library. Modules: `config`, `distro`,
-  `download`, `error`, `extract`, `initramfs`, `kernel`, `progress`,
-  `qemu`, `rootfs`, `utils`, `vm`.
+  `download`, `error`, `extract`, `guest` (the init script), `krun`
+  (the FFI), `progress`, `rootfs`, `utils`, `vm`.
 - `crates/ecrou-cli` - the CLI (binary `ecrou`).
 
 The library must not depend on CLI types; `clap` is a CLI-only
@@ -161,11 +191,13 @@ for narration, `Progress` for long operations.
 
 ### Rootfs lifecycle (ported)
 
-`RootfsCache::new(dir)` / `default_dir()`, `prepare`, `prepare_provisioned`,
-`persist`, `PrepareRequest`, `PreparedRootfs`: ecr's semantics verbatim,
-including digest freshness on `:latest` and the `.provisioned` hot-cell
-marker. See ecr's SPEC for the reference description; differences are
-the cache directory and the kernel entry names only.
+`RootfsCache::new(dir)` / `default_dir()`, `prepare`,
+`prepare_provisioned`, `persist`, `PrepareRequest`, `PreparedRootfs`:
+ecr's semantics verbatim, including digest freshness on `:latest` and
+the `.provisioned` hot-cell marker. The per-run scratch copy is
+`PreparedRootfs` as ecr already builds it. See ecr's SPEC for the
+reference description; differences are the cache directory and the
+absent kernel entries only.
 
 ### `vm::run`
 
@@ -178,21 +210,20 @@ pub struct RunOptions {
     pub workspace: Option<Share>,   // the one rw share consumers name
     pub shares: Vec<Share>,     // additional named shares, ro allowed
     pub command: Vec<String>,   // empty = the image's default shell
-    pub workdir: String,        // guest cwd; empty = first share's guest path, else /
+    pub workdir: String,        // guest cwd; empty = /
     pub env: Vec<(String, String)>, // composed envp; host env never inherited
     pub hostname: String,       // empty = generated ecrou-vm-XXXXXX
     pub quiet: bool,
-    pub require_kvm: bool,
 }
 pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32>
 ```
 
-stdio is inherited; the return value is the guest exit code. A
-`require_kvm` run with no working KVM is `Error::KvmUnavailable` with
-the remediation text. Everything else is `Error::Other` over the anyhow
-chain, ecr's shape. The v1 API has no captured-output variant and no
-long-lived machine; consumers pump the child's stdio themselves when
-they drive the CLI.
+stdio is inherited; the return value is the guest exit code. A run
+without working KVM is `Error::KvmUnavailable` with the remediation
+text. Everything else is `Error::Other` over the anyhow chain, ecr's
+shape. The v1 API has no captured-output variant and no long-lived
+machine; consumers pump the child's stdio themselves when they drive
+the CLI.
 
 ## CLI
 
@@ -206,17 +237,16 @@ ecrou probe
 | `-a, --arch <arch>` | host arch | Target architecture |
 | `--share <HOST:GUEST[:ro]>` | none | Workspace share; repeatable |
 | `-m, --memory <size>` | 1G | Guest memory |
-| `--workdir <guest path>` | first share, else `/` | Guest cwd |
+| `--workdir <guest path>` | `/` | Guest cwd |
 | `-e, --env <KEY=VALUE>` | none | Guest env; repeatable |
-| `--require-kvm` | false | Fail instead of falling back to TCG |
-| `--monitor` | false | Dev: mux the QEMU monitor onto stdio |
 | `--quiet` | false | Suppress kernel log on the console |
 | `--no-cache` | false | Fresh download, ignore the cache |
-| `-v, --verbose` | false | Diagnostics |
+| `-v, --verbose` | false | Diagnostics; raises the libkrun log level |
 
-`ecrou probe` reports what a run would find: KVM working or the TCG
-fallback, the QEMU binary, the kernel in cache, the cache directory
-writable. It is the confinement diagnostic and the support tool.
+`ecrou probe` reports what a run would find: KVM working (open, ioctl
+version, nested-virt state), `libkrun.so.1` loadable, the cache
+directory writable. It is the confinement diagnostic and the support
+tool.
 
 ## File layout
 
@@ -225,8 +255,7 @@ writable. It is the confinement diagnostic and the support tool.
 ├── ubuntu-noble-amd64.tar.gz
 ├── alpine-edge-x86_64.tar.gz
 ├── <...>.digest                        # manifest digest sidecar
-├── <...>.provisioned                   # hot-cell marker
-└── ecrou-default-kernel-x86_64.vmlinuz
+└── <...>.provisioned                   # hot-cell marker
 ```
 
 `~/.config/ecrou.yaml` carries over (DNS overrides today).
@@ -237,57 +266,71 @@ Confinement: strict. Plugs: `network`, `home`, `kvm`. Manual
 `snap connect` for kvm is accepted for now; auto-connect is a store
 request and a later product decision.
 
-The first milestone is the spike snap, ecr's VM mode behind strict
-confinement, before any porting: stage `qemu-system-x86_64` and the
-kernel in the snap, or fetch both through the cache in $HOME. Both fit
-the budget; T1 is the gate that proves the shape under real AppArmor
-and seccomp, and everything else in this document is design until it
-passes.
+The snap stages `libkrun.so.1` and libkrunfw next to the binary; at
+roughly 6 MB combined they cost less than any qemu-system package, and
+the kernel ships inside libkrunfw, so there is nothing else to fetch or
+stage.
+
+The first milestone is the spike snap, before any porting: a minimal
+libkrun binary behind strict confinement running a VM. T1 is the gate
+that proves the shape under real AppArmor and seccomp, and everything
+else in this document is design until it passes.
 
 ## Falsification tests
 
 - **T1, confinement.** The spike snap runs `ecrou run alpine -- uname
   -a` under strict confinement. The guest kernel version differing from
   the host is the microVM proof, the same check crun's krun man page
-  prescribes.
+  prescribes. The same run straces for EPERM on plausible VMM calls
+  (`sched_setaffinity`, `openat2`) and reports findings to the snapd
+  issue list.
 - **T2, workspace coherence.** In a shared workspace, the guest runs
   git init, add, commit, status; the host sees the commits; a second
   machine sees the first's writes. Git's mmap'd index is the trap this
-  test exists for.
+  test exists for, and libkrun's virtiofs DAX windows are exactly where
+  it bites.
 - **T3, exit codes.** `ecrou run alpine -- sh -c "exit 7"` exits 7.
-  A guest signal death exits 128+signal. A killed QEMU reports an
+  A guest signal death exits 128+signal. A failed VMM reports an
   engine failure, never a guest code.
-- **T4, kill chain.** SIGKILL ecrou-cli mid-run; QEMU is gone within a
-  second, no orphan, verified by scanning the process table.
-- **T5, boot economics.** KVM boot-to-init for alpine with
-  `linux-virt` lands under 1.5 s including the module-tree pack cost.
-  TCG numbers are recorded, not gated.
+- **T4, kill chain.** SIGKILL ecrou-cli mid-run; the VM is gone with
+  the process, no stray threads or KVM VMs, verified by scanning the
+  process table and `/dev/kvm` users.
+- **T5, boot economics.** Alpine, cache-warm: extract plus boot lands
+  under 1.5 s to first guest output. Larger images report their numbers
+  unblocked; the shared-ro-rootfs row in Later is the fix if they hurt.
 - **T6, no-mount audit.** `strace -f -e trace=mount,umount2,unshare,
   setns,pivot_root,open_tree,move_mount,fsopen,fsmount` over a full run
   with shares: zero hits. This test is the founding rule.
-- **T7, guest network.** An https fetch from the guest succeeds.
+- **T7, guest network.** An https fetch from the guest succeeds, DNS
+  included; a published port is reachable from the host.
 
 ## Later
 
-- **libkrun engine.** The FFI lives here; ecrou already carries unsafe
-  libc, and rhema keeps its `forbid(unsafe_code)`. Sub-second boots,
-  the kernel bundled in libkrunfw, TSI networking instead of slirp.
-  Same budget, one more engine.
-- **Tiny initramfs.** A fixed small init with the rootfs itself served
-  over 9p, killing the per-run pack cost and the RAM floor.
+- **QEMU engine.** The TCG fallback for machines without KVM. The
+  `RunOptions` API does not change; the engine choice is the probe's.
+- **Shared read-only rootfs.** Serve the cache rootfs directly, ro,
+  with a guest-side overlay for writes: no extraction per run. The
+  correct-and-slow v1 posture graduates into this.
 - **Guest agent, long-lived machines.** Exec without a boot; the shape
   to grow into when per-command VMs stop being right.
-- **passt** if slirp throughput ever matters.
-- **sandboxd-in-guest** over hostfwd: rhema's http backend pointed
-  into a machine.
+- **passt** (`krun_set_passt_fd`) if TSI throughput or UDP listening
+  ever matters.
+- **sandboxd-in-guest** over `krun_set_port_map`: rhema's http backend
+  pointed into a machine.
 - **Rootfs persistence** through `prepare_provisioned` hot cells,
   already in the ported code.
 
 ## Open questions
 
-- 9p versus virtiofsd as the share transport. 9p needs no extra daemon;
-  virtiofsd is the modern path but is another staged binary. Decide
-  when T2 runs; the `Share` API does not change either way.
-- Initramfs compression default: uncompressed boots fastest, gzip
-  halves the RAM floor. Measure in T5.
-- Whether `probe` belongs in the library or stays CLI-only.
+- Does `krun_start_enter` return the guest exit code natively on
+  poweroff? The control file works regardless; if the return value
+  carries it, the mechanism shrinks to a read.
+- Console wiring: does the default virtio-console land on the VMM's
+  stdio, and is stdin carried? Decided by a first-run experiment, with
+  `krun_set_console_output` as the fallback.
+- TSI DNS: which resolver file the guest needs, and whether lookups
+  just work. T7 decides.
+- dlopen versus link-time linking for the snap; dlopen is the default
+  for the remediation error it enables.
+- Which distros package libkrun (Fedora does; Debian and Ubuntu do not
+  yet) and what the dev-install story says meanwhile.
