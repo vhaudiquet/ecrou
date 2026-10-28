@@ -38,9 +38,6 @@ fn cmd_run(args: &RunArgs, cli_verbose: bool) -> std::process::ExitCode {
         no_cache: args.no_cache,
         ..RunOptions::default()
     };
-    if let Some(arch) = &args.arch {
-        options.arch = arch.clone();
-    }
     for spec in &args.env {
         match parse_env(spec) {
             Ok((k, v)) => options.env.push((k, v)),

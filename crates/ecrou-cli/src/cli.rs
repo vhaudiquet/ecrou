@@ -46,9 +46,6 @@ pub struct RunArgs {
     /// Guest environment KEY=VALUE (repeatable)
     #[arg(short = 'e', long = "env")]
     pub env: Vec<String>,
-    /// Target architecture; the host architecture when omitted
-    #[arg(short = 'a', long)]
-    pub arch: Option<String>,
     /// Suppress console noise
     #[arg(long)]
     pub quiet: bool,
