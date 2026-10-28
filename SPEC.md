@@ -242,6 +242,7 @@ pub struct RunOptions {
     pub env: Vec<(String, String)>, // composed envp; host env never inherited
     pub hostname: String,       // empty = generated ecrou-vm-XXXXXX
     pub log_level: LogLevel,    // Quiet | Normal | Verbose
+    pub capture: Option<PathBuf>,   // payload stdout/stderr into files
 }
 pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32>
 ```
@@ -250,9 +251,19 @@ Guest output reaches real stdout through the streamed console; the
 return value is the guest exit code. A run
 without working KVM is `Error::KvmUnavailable` with the remediation
 text. Everything else is `Error::Other` over the anyhow chain, ecr's
-shape. The v1 API has no captured-output variant and no long-lived
-machine; consumers pump the child's stdio themselves when they drive
-the CLI.
+shape. There is no long-lived machine; consumers pump the child's
+stdio themselves when they drive the CLI.
+
+**Capture.** The console is one stream, kernel and guest mixed, and a
+consumer that needs the payload's stdout and stderr apart - rhema's
+sandbox seam reports them as separate fields - cannot read it. With
+`capture` set, the run adds the directory as an internal rw share
+(guest path `/.ecrou-io`, reserved), and the init wraps the payload in
+a redirection group pointing at it: the two streams land host-side as
+`<dir>/stdout` and `<dir>/stderr`, written live, owned by the host
+user, and simply there when `run` returns. The console stays on stdout
+for diagnostics, which is what makes capture and a nulled stdout
+composable. A boot failure leaves the files absent.
 
 ## CLI
 
@@ -268,6 +279,7 @@ ecrou probe
 | `--workdir <guest path>` | `/` | Guest cwd |
 | `-e, --env <KEY=VALUE>` | none | Guest env; repeatable |
 | `--quiet` | false | Suppress kernel log on the console |
+| `--capture <DIR>` | none | Payload stdout/stderr into `<DIR>/stdout` and `<DIR>/stderr` |
 | `--no-cache` | false | Fresh download, ignore the cache |
 | `-v, --verbose` | false | Diagnostics; raises the libkrun log level |
 

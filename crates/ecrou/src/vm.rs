@@ -45,6 +45,15 @@ pub struct RunOptions {
     /// How much of the engine's own logging reaches stderr
     pub log_level: LogLevel,
     pub no_cache: bool,
+    /// When set, the payload's stdout and stderr are captured into
+    /// files in this host directory (`stdout` and `stderr` under it):
+    /// the run adds the directory as an internal read-write share,
+    /// mounted in the guest at [`crate::guest::CAPTURE_DIR`], and the
+    /// init points the payload's streams at it. The console stays on
+    /// stdout for diagnostics; the files land host-side as the guest
+    /// writes them and are simply there when `run` returns. A boot
+    /// failure leaves them absent.
+    pub capture: Option<std::path::PathBuf>,
 }
 
 /// How much of the engine's own logging reaches stderr. The engine
@@ -75,6 +84,7 @@ impl Default for RunOptions {
             hostname: String::new(),
             log_level: LogLevel::Normal,
             no_cache: false,
+            capture: None,
         }
     }
 }
@@ -105,7 +115,21 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32> {
         options.hostname.clone()
     };
 
-    let share_pairs = collect_shares(&rootfs, options).map_err(Error::Other)?;
+    let capture_share = options
+        .capture
+        .as_ref()
+        .map(|dir| {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("creating the capture directory {}", dir.display()))?;
+            Ok(Share {
+                host: dir.clone(),
+                guest: guest::CAPTURE_DIR.to_string(),
+                read_only: false,
+            })
+        })
+        .transpose()
+        .map_err(Error::Other)?;
+    let share_pairs = collect_shares(&rootfs, options, capture_share).map_err(Error::Other)?;
     let shares = share_pairs
         .iter()
         .map(|(_, gs)| gs.clone())
@@ -117,7 +141,17 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32> {
     // contract (it writes the control file), the share mounter, and the
     // hostname applier.
     let init_path = rootfs.dir().join("ecrou-init");
-    let script = guest::init_script(&shares, &payload, &options.workdir, &hostname);
+    let capture = options.capture.as_ref().map(|_| guest::GuestCapture {
+        stdout: guest::CAPTURE_STDOUT.to_string(),
+        stderr: guest::CAPTURE_STDERR.to_string(),
+    });
+    let script = guest::init_script(
+        &shares,
+        &payload,
+        &options.workdir,
+        &hostname,
+        capture.as_ref(),
+    );
     std::fs::write(&init_path, script)
         .with_context(|| format!("writing {}", init_path.display()))?;
     set_exec_bit(&init_path)?;
@@ -344,12 +378,17 @@ fn decode_status(status: libc::c_int, exit_file_host: &Path) -> Result<i32> {
 fn collect_shares(
     rootfs: &PreparedRootfs,
     options: &RunOptions,
+    capture: Option<Share>,
 ) -> anyhow::Result<Vec<(Share, GuestShare)>> {
     let mut all = Vec::new();
     if let Some(ws) = &options.workspace {
         all.push(ws.clone());
     }
     all.extend(options.shares.iter().cloned());
+    // The capture share rides last, after every caller share.
+    if let Some(cap) = capture {
+        all.push(cap);
+    }
 
     let mut out = Vec::with_capacity(all.len());
     for (i, share) in all.iter().enumerate() {

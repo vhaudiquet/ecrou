@@ -49,6 +49,10 @@ pub struct RunArgs {
     /// Suppress console noise
     #[arg(long)]
     pub quiet: bool,
+    /// Capture the payload's stdout and stderr into files in this
+    /// directory: DIR/stdout and DIR/stderr. Created when missing.
+    #[arg(long)]
+    pub capture: Option<std::path::PathBuf>,
     /// Ignore the cache and download a fresh image
     #[arg(long)]
     pub no_cache: bool,

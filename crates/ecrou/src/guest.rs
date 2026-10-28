@@ -18,6 +18,23 @@ pub struct GuestShare {
 /// scratch directory.
 pub const EXIT_FILE: &str = "/.ecrou-exit";
 
+/// The guest path the capture share mounts at, when the run captures
+/// the payload's output. Reserved: no caller share may take it.
+pub const CAPTURE_DIR: &str = "/.ecrou-io";
+/// The payload's stdout, host-side under the capture directory.
+pub const CAPTURE_STDOUT: &str = "/.ecrou-io/stdout";
+/// The payload's stderr, host-side under the capture directory.
+pub const CAPTURE_STDERR: &str = "/.ecrou-io/stderr";
+
+/// Where the init points the payload's stdout and stderr when the run
+/// captures them: guest paths under [`CAPTURE_DIR`], which the caller
+/// reads host-side as files in its capture directory.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GuestCapture {
+    pub stdout: String,
+    pub stderr: String,
+}
+
 /// Shell-quote a string for safe interpolation into the init script.
 /// Single quotes wrap everything; an embedded single quote closes,
 /// escapes, and reopens.
@@ -33,6 +50,7 @@ pub fn init_script(
     payload: &[String],
     workdir: &str,
     hostname: &str,
+    capture: Option<&GuestCapture>,
 ) -> String {
     let mut script = String::from(
         "#!/bin/sh\n\
@@ -75,9 +93,26 @@ pub fn init_script(
         sh_quote(if workdir.is_empty() { "/" } else { workdir })
     ));
 
+    // Captured runs wrap the payload in a redirection group: the
+    // streams cross the capture share as files, and the group's exit
+    // status - the payload's - is what `code=$?` reads below. The
+    // console stays free for kernel and init diagnostics.
+    if capture.is_some() {
+        script.push_str("{ ");
+    }
     for arg in payload {
         script.push_str(&sh_quote(arg));
         script.push(' ');
+    }
+    if let Some(cap) = capture {
+        script.push_str(
+            format!(
+                "; }} > {} 2> {} ",
+                sh_quote(&cap.stdout),
+                sh_quote(&cap.stderr)
+            )
+            .as_str(),
+        );
     }
     script.push_str("\n\ncode=$?\n");
     script.push_str(&format!("echo \"$code\" > {}\n", sh_quote(EXIT_FILE)));
@@ -116,7 +151,7 @@ mod tests {
                 read_only: true,
             },
         ];
-        let script = init_script(&shares, &["true".to_string()], "/", "ecrou-vm-x");
+        let script = init_script(&shares, &["true".to_string()], "/", "ecrou-vm-x", None);
         assert!(script.contains("mount_share 'ws0' '/workspace' 'rw'"));
         assert!(script.contains("mount_share 'sk1' '/mnt/skills' 'ro'"));
     }
@@ -128,7 +163,7 @@ mod tests {
             "-c".to_string(),
             "echo $HOME; rm -rf '/'".to_string(),
         ];
-        let script = init_script(&[], &payload, "/", "ecrou-vm-x");
+        let script = init_script(&[], &payload, "/", "ecrou-vm-x", None);
         assert!(script.contains(r"'/bin/bash' '-c' 'echo $HOME; rm -rf '\''/'\''' "));
         // The payload line must appear after the cd and before the code
         // capture, so its exit code is what gets written.
@@ -140,7 +175,7 @@ mod tests {
 
     #[test]
     fn writes_exit_code_then_exits() {
-        let script = init_script(&[], &["true".to_string()], "/work", "ecrou-vm-x");
+        let script = init_script(&[], &["true".to_string()], "/work", "ecrou-vm-x", None);
         assert!(script.contains(&format!("echo \"$code\" > '{}'", EXIT_FILE)));
         // The file write must precede the exit: it is the only
         // diagnostic when a boot dies without the init running.
@@ -156,14 +191,45 @@ mod tests {
 
     #[test]
     fn hostname_lands_in_proc_and_etc() {
-        let script = init_script(&[], &["true".to_string()], "/", "ecrou-vm-x");
+        let script = init_script(&[], &["true".to_string()], "/", "ecrou-vm-x", None);
         assert!(script.contains("echo 'ecrou-vm-x' > /proc/sys/kernel/hostname"));
         assert!(script.contains("echo 'ecrou-vm-x' > /etc/hostname"));
     }
 
     #[test]
+    fn capture_wraps_the_payload_and_points_at_the_reserved_share() {
+        let cap = GuestCapture {
+            stdout: CAPTURE_STDOUT.into(),
+            stderr: CAPTURE_STDERR.into(),
+        };
+        let script = init_script(
+            &[],
+            &["true".to_string()],
+            "/work",
+            "ecrou-vm-x",
+            Some(&cap),
+        );
+        // The payload line is a redirection group: the group's exit
+        // status, which `code=$?` reads, is the payload's.
+        assert!(script.contains("{ 'true' ; } > '/.ecrou-io/stdout' 2> '/.ecrou-io/stderr' "));
+        let payload_at = script.find("{ 'true'").unwrap();
+        let capture_at = script.find("code=$?").unwrap();
+        assert!(payload_at < capture_at);
+    }
+
+    #[test]
+    fn capture_paths_are_quoted_like_any_operand() {
+        let cap = GuestCapture {
+            stdout: "/.ecrou-io/stdout".into(),
+            stderr: "/.ecrou-io/stderr".into(),
+        };
+        let script = init_script(&[], &["echo it's".to_string()], "/", "x", Some(&cap));
+        assert!(script.contains("echo it'\\''s"));
+    }
+
+    #[test]
     fn empty_workdir_falls_back_to_root() {
-        let script = init_script(&[], &["true".to_string()], "", "ecrou-vm-x");
+        let script = init_script(&[], &["true".to_string()], "", "ecrou-vm-x", None);
         assert!(script.contains("cd '/'"));
     }
 }

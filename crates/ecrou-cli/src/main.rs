@@ -36,6 +36,7 @@ fn cmd_run(args: &RunArgs, cli_verbose: bool) -> std::process::ExitCode {
             LogLevel::Normal
         },
         no_cache: args.no_cache,
+        capture: args.capture.clone(),
         ..RunOptions::default()
     };
     for spec in &args.env {
