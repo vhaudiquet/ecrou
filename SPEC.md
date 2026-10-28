@@ -380,6 +380,13 @@ else in this document is design until it passes.
   correct-and-slow v1 posture graduates into this.
 - **Guest agent, long-lived machines.** Exec without a boot; the shape
   to grow into when per-command VMs stop being right.
+- **Provisioned layers, keyed.** `provision` today bakes one entry
+  per image; the next step keys entries by (base digest, hash of the
+  provisioning spec) so consumers — rhema's projects — each get their
+  own layer over a shared base, the spec file living in the repo and
+  the artifact reproducible from it. Marker-hit semantics then skip
+  the command only for the identical spec, and eviction (LRU or an
+  explicit prune) keeps derived entries bounded.
 - **passt** (`krun_set_passt_fd`) if TSI throughput or UDP listening
   ever matters.
 - **sandboxd-in-guest** over `krun_set_port_map`: rhema's http backend
