@@ -141,6 +141,30 @@ impl Krun {
         )
     }
 
+    /// Attach the vsock device with explicit TSI flags. Without this
+    /// the engine runs TSI in heuristics mode, where guest TLS traffic
+    /// crawls (~17 KB/s against a CDN); hijacking AF_INET outright
+    /// puts it on the fast path. Flag bit 0 hijacks AF_INET/AF_INET6,
+    /// bit 1 AF_UNIX.
+    pub fn add_vsock(&self, ctx_id: u32, tsi_flags: u32) -> Result<()> {
+        // The engine materializes an implicit vsock by default; the
+        // explicit one is only accepted once that is switched off.
+        let f = symbol!(
+            self.lib,
+            b"krun_disable_implicit_vsock\0",
+            unsafe extern "C" fn(u32) -> i32
+        );
+        // Safety: plain integer context id.
+        krun_ret(unsafe { f(ctx_id) }, "krun_disable_implicit_vsock")?;
+        let f = symbol!(
+            self.lib,
+            b"krun_add_vsock\0",
+            unsafe extern "C" fn(u32, u32) -> i32
+        );
+        // Safety: plain integers; the engine validates the flag bits.
+        krun_ret(unsafe { f(ctx_id, tsi_flags) }, "krun_add_vsock")
+    }
+
     /// `krun_set_workdir`
     pub fn set_workdir(&self, ctx_id: u32, workdir: &str) -> Result<()> {
         let workdir_c = CString::new(workdir).context("workdir contains a NUL")?;

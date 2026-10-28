@@ -140,6 +140,9 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32> {
     for (share, gs) in &share_pairs {
         krun.add_virtiofs(ctx, &gs.tag, &share.host)?;
     }
+    // Explicit vsock with AF_INET hijacked: the implicit heuristics
+    // mode proxies fine for plain HTTP but starves TLS.
+    krun.add_vsock(ctx, 0b1)?;
     // The blob chdirs from KRUN_WORKDIR before exec; the script's cd
     // stays as the fallback path.
     if !options.workdir.is_empty() && options.workdir != "/" {
