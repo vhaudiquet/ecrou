@@ -21,6 +21,23 @@ pub struct Cli {
 pub enum Command {
     /// Run a command in a fresh microVM from an image
     Run(RunArgs),
+    /// Bake a command into an image's cache entry: the command runs in
+    /// a machine over a freshly prepared rootfs, and the result is
+    /// persisted, so every later boot of the image carries what the
+    /// command installed. Cached entries are reused as-is; --no-cache
+    /// re-downloads and re-provisions.
+    Provision {
+        /// Distribution name or OCI image reference
+        image: String,
+        /// Ignore the cache and download a fresh image
+        #[arg(long)]
+        no_cache: bool,
+        /// The provisioning command. An argument vector after `--` is
+        /// taken literally; a single quoted line runs through the
+        /// image's shell.
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
     /// Report what a run would find on this host
     Probe,
 }

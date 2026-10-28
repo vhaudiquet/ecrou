@@ -129,6 +129,19 @@ impl RootfsCache {
                 format!("Failed to create cache directory {}", self.dir.display())
             })?;
             download_image(&source, &cache_path, &arch, progress)?;
+            // Whatever was provisioned belonged to the entry this just
+            // replaced. A stale marker here would present the pristine
+            // image as provisioned and skip the next provisioning for
+            // good.
+            let marker = sidecar(&cache_path, PROVISIONED_SUFFIX);
+            if marker.exists() {
+                std::fs::remove_file(&marker).with_context(|| {
+                    format!(
+                        "Failed to drop the stale provisioned marker {}",
+                        marker.display()
+                    )
+                })?;
+            }
         } else {
             log::debug!("Using cached tarball: {}", cache_path.display());
         }

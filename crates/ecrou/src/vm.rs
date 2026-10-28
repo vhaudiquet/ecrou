@@ -91,6 +91,21 @@ impl Default for RunOptions {
 
 /// Run one machine to completion and return the payload's exit code.
 pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32> {
+    let mut request = PrepareRequest::new(options.image.clone());
+    request.arch = options.arch.clone();
+    request.no_cache = options.no_cache;
+    let cache = RootfsCache::new(RootfsCache::default_dir()?);
+    let rootfs = cache
+        .prepare(&request, progress)
+        .context("preparing the rootfs")?;
+    run_prepared(&rootfs, options)
+}
+
+/// Boot one machine over an already-prepared rootfs. This is the whole
+/// boot half of [`run`], and the engine the provisioner drives: it
+/// wants a machine over the extracted tree it is about to persist,
+/// before that tree becomes the cache entry every later boot sees.
+pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32> {
     if options.image.is_empty() {
         return Err(Error::Other(anyhow!("no image given")));
     }
@@ -100,14 +115,6 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32> {
 
     let ram_mib = parse_memory_mib(&options.memory).map_err(Error::Other)?;
     let vcpus = vcpus();
-
-    let mut request = PrepareRequest::new(options.image.clone());
-    request.arch = options.arch.clone();
-    request.no_cache = options.no_cache;
-    let cache = RootfsCache::new(RootfsCache::default_dir()?);
-    let rootfs = cache
-        .prepare(&request, progress)
-        .context("preparing the rootfs")?;
 
     let hostname = if options.hostname.is_empty() {
         format!("ecrou-vm-{}", utils::random_suffix(HOSTNAME_SUFFIX_LEN))
@@ -129,7 +136,7 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32> {
         })
         .transpose()
         .map_err(Error::Other)?;
-    let share_pairs = collect_shares(&rootfs, options, capture_share).map_err(Error::Other)?;
+    let share_pairs = collect_shares(rootfs, options, capture_share).map_err(Error::Other)?;
     let shares = share_pairs
         .iter()
         .map(|(_, gs)| gs.clone())

@@ -18,7 +18,66 @@ fn main() -> std::process::ExitCode {
     logger::init(cli.verbose);
     match cli.command {
         Command::Run(args) => cmd_run(&args, cli.verbose),
+        Command::Provision {
+            image,
+            no_cache,
+            command,
+        } => cmd_provision(&image, no_cache, &command, cli.verbose),
         Command::Probe => cmd_probe(),
+    }
+}
+
+fn cmd_provision(
+    image: &str,
+    no_cache: bool,
+    command: &[String],
+    cli_verbose: bool,
+) -> std::process::ExitCode {
+    use ecrou::rootfs::{PrepareRequest, RootfsCache};
+
+    if command.is_empty() {
+        return fail(&anyhow::anyhow!(
+            "provision needs a command: ecrou provision <IMAGE> -- <COMMAND...>"
+        ));
+    }
+    let level = if cli_verbose {
+        LogLevel::Verbose
+    } else {
+        LogLevel::Normal
+    };
+    let mut options = RunOptions {
+        image: image.to_owned(),
+        command: command.to_owned(),
+        log_level: level,
+        // The machine exists to change the rootfs, not to cross a
+        // share: the workspace would ride the persist into the cache.
+        ..RunOptions::default()
+    };
+    options.workdir = "/".to_owned();
+
+    let progress: &dyn Progress = &TermProgress::new();
+    let request = PrepareRequest {
+        image: image.to_owned(),
+        arch: String::new(),
+        no_cache,
+    };
+    let dir = match RootfsCache::default_dir() {
+        Ok(dir) => dir,
+        Err(err) => return fail(&anyhow::Error::new(err)),
+    };
+    let cache = RootfsCache::new(dir);
+    let outcome = cache.prepare_provisioned(&request, progress, |rootfs| {
+        let code = ecrou::vm::run_prepared(rootfs, &options)?;
+        if code != 0 {
+            anyhow::bail!(
+                "the provisioning command exited {code}; the cache entry was left unprovisioned"
+            );
+        }
+        Ok(())
+    });
+    match outcome {
+        Ok(_rootfs) => std::process::ExitCode::SUCCESS,
+        Err(err) => fail(&anyhow::Error::new(err)),
     }
 }
 

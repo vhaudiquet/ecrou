@@ -269,6 +269,7 @@ composable. A boot failure leaves the files absent.
 
 ```
 ecrou run [OPTIONS] <IMAGE> [-- COMMAND...]
+ecrou provision [OPTIONS] <IMAGE> [-- COMMAND...]
 ecrou probe
 ```
 
@@ -282,6 +283,17 @@ ecrou probe
 | `--capture <DIR>` | none | Payload stdout/stderr into `<DIR>/stdout` and `<DIR>/stderr` |
 | `--no-cache` | false | Fresh download, ignore the cache |
 | `-v, --verbose` | false | Diagnostics; raises the libkrun log level |
+
+`ecrou provision IMAGE -- COMMAND` bakes a command into the image's
+cache entry: the command runs in a machine over a freshly prepared
+rootfs and the result is persisted, so every later boot of that image
+carries what the command installed — packages, users, whatever a
+one-shot boot cannot keep. A marked entry is reused as-is (the
+command is skipped), `--no-cache` re-downloads and re-provisions, and
+a failing command leaves the entry unprovisioned for the next attempt.
+The marker dies with the entry: a digest refresh drops it, so a moved
+upstream image is provisioned again, never silently served pristine
+under an old marker.
 
 `ecrou probe` reports what a run would find: KVM working (open, ioctl
 version, nested-virt state), `libkrun.so.1` loadable, the cache
