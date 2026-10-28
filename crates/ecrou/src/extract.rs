@@ -260,6 +260,12 @@ fn extract_tar<R: std::io::Read>(
 /// order does not guarantee their prerequisites exist yet.
 #[derive(Default)]
 struct DeferredFixups {
+    /// Regular-file entries with the mode they ship; applied after the
+    /// walk.  The crate's own chmod runs with the special bits masked
+    /// off (see `extract_archive`), so this is where a setgid binary
+    /// gets its bit back — degraded, not fatal, when the filesystem
+    /// refuses it.
+    file_modes: Vec<(PathBuf, u32)>,
     /// Directory entries with the mode they ship; applied last.  Images
     /// routinely ship read-only directories (Fedora's ca-trust tree is
     /// dr-xr-xr-x) whose contents would be rejected by an eagerly-applied
@@ -304,17 +310,42 @@ fn normalize_within(dest: &Path, target: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
-/// Apply hard links and directory modes collected during extraction.
+/// Apply hard links and the collected modes after extraction.
 fn apply_fixups(dest: &Path, fixups: &mut DeferredFixups) -> anyhow::Result<()> {
     for (dst, target) in fixups.hard_links.drain(..) {
         apply_hard_link(dest, &dst, &target)?;
     }
+    for (path, mode) in fixups.file_modes.drain(..) {
+        set_shipped_mode(&path, mode);
+    }
     for (path, mode) in fixups.dir_modes.drain(..) {
-        // Errors are ignored: a later layer's whiteout may have removed the
-        // directory, and the mode is cosmetic for our chroot use.
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+        set_shipped_mode(&path, mode);
     }
     Ok(())
+}
+
+/// Apply one shipped mode, degrading the special bits when the
+/// filesystem refuses them.  Images ship setgid binaries (alpine's
+/// `chage`, group `shadow`) and setgid directories, and an extracting
+/// context that cannot set the bit — an overlayfs tmp, a confined
+/// sandbox — fails the chmod with EPERM outright.  Unprivileged tar
+/// degrades the same way: keep the rwx bits, drop setuid/setgid/
+/// sticky, and let the guest re-apply what it needs.  The extract
+/// never dies for a mode again; a refused plain chmod is only a
+/// warning (a later layer's whiteout may have removed the path, and
+/// the mode is cosmetic for a machine that lives for one command).
+fn set_shipped_mode(path: &Path, mode: u32) {
+    let applied = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    if applied.is_err() && mode & 0o7000 != 0 {
+        let plain = mode & !0o7000;
+        log::debug!(
+            "chmod {:o} refused for {}; extracting {:o} instead",
+            mode,
+            path.display(),
+            plain
+        );
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(plain));
+    }
 }
 
 /// Materialize one hard link.  A real hard link is used when the target
@@ -352,7 +383,14 @@ fn extract_archive<R: std::io::Read>(
 ) -> anyhow::Result<()> {
     progress.begin(label, Unit::Files, None);
 
-    archive.set_preserve_permissions(true);
+    // Permissions are applied by hand through the fixups, not here:
+    // with preservation on, the crate chmods each file to the mode it
+    // ships, and a setgid entry meeting a filesystem that refuses the
+    // bit kills the whole extract with EPERM.  With preservation off
+    // the crate's own chmod masks to plain rwx, which no filesystem
+    // refuses, and the shipped modes come back through the fixups —
+    // degraded where they must be, exact everywhere else.
+    archive.set_preserve_permissions(false);
     archive.set_preserve_ownerships(false);
     archive.set_unpack_xattrs(false);
 
@@ -423,6 +461,17 @@ fn extract_archive<R: std::io::Read>(
             entry
                 .unpack_in(dest)
                 .with_context(|| format!("Failed to extract {}", path.display()))?;
+            // The crate left the file at plain rwx; the shipped mode —
+            // special bits included — goes through the fixups.  A
+            // symlink is skipped: set_permissions follows links, and a
+            // link's own mode is nothing anyone can apply.
+            if !entry.header().entry_type().is_symlink() {
+                if let Some(dest_path) = safe_join(dest, &path) {
+                    if let Ok(mode) = entry.header().mode() {
+                        fixups.file_modes.push((dest_path, mode));
+                    }
+                }
+            }
         }
 
         count += 1;
@@ -549,6 +598,45 @@ mod tests {
         );
         let dir_mode = base.symlink_metadata().unwrap().permissions().mode() & 0o7777;
         assert_eq!(dir_mode, 0o555, "shipped directory mode must be restored");
+    }
+
+    /// Alpine ships setgid-shadow binaries (usr/bin/chage at 02755,
+    /// group `shadow`) and setgid directories.  Their modes no longer
+    /// ride the crate's own chmod — one refused setgid bit there killed
+    /// the whole extract with EPERM — so they must come back through the
+    /// fixups exactly where the filesystem allows the bits.
+    #[test]
+    fn setgid_entries_keep_their_shipped_modes() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let tarball = src.path().join("rootfs.tar");
+        build_tar(
+            &tarball,
+            &[
+                ("usr/", EntryType::Directory, 0o755, b""),
+                ("usr/bin/", EntryType::Directory, 0o755, b""),
+                ("usr/bin/chage", EntryType::Regular, 0o2755, b"#!/bin/sh\n"),
+                // setuid and setgid together, the way su ships
+                ("usr/bin/su", EntryType::Regular, 0o6755, b"#!/bin/sh\n"),
+                ("usr/bin/plain", EntryType::Regular, 0o644, b"plain"),
+                ("var/", EntryType::Directory, 0o755, b""),
+                ("var/spool/", EntryType::Directory, 0o2755, b""),
+            ],
+        );
+
+        extract_tarball(&tarball, out.path(), &NoProgress).unwrap();
+
+        let mode = |p: &str| {
+            std::fs::symlink_metadata(out.path().join(p))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        assert_eq!(mode("usr/bin/chage"), 0o2755, "setgid restored");
+        assert_eq!(mode("usr/bin/su"), 0o6755, "setuid and setgid restored");
+        assert_eq!(mode("usr/bin/plain"), 0o644, "plain modes untouched");
+        assert_eq!(mode("var/spool"), 0o2755, "setgid directories restored");
     }
 
     #[test]
