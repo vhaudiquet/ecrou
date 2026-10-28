@@ -263,7 +263,6 @@ ecrou probe
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-a, --arch <arch>` | host arch | Target architecture |
 | `--share <HOST:GUEST[:ro]>` | none | Workspace share; repeatable |
 | `-m, --memory <size>` | 1G | Guest memory |
 | `--workdir <guest path>` | `/` | Guest cwd |
