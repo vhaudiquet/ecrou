@@ -186,8 +186,14 @@ still forwarded into the guest). There is no QEMU monitor to mux;
 
 **Networking.** TSI, libkrun's default: the guest has no interface, and
 its socket calls are proxied on the host's stack by the VMM process.
-DNS is proxied with them (verified in T7, including the resolver file
-the guest needs). Port publishing (`krun_set_port_map`) is how a later
+ecrou pins it explicitly (a vsock with AF_INET hijacked) instead of
+leaving the heuristics mode to sniff. The guest resolver is the host's
+uplink config with loopback nameservers stripped (loopback never
+crosses the proxy; verified by hand). DNS is proxied with the rest.
+Known upstream limitation: per-stream throughput in this generation of
+the ln driver is tens of KB/s against a CDN, TLS included; workable,
+not fast, and worth re-measuring on every engine update. Port
+publishing (`krun_set_port_map`) is how a later
 sandboxd-in-guest serves the host. No tap, no bridges, ever: they need
 host setup the budget cannot afford.
 
