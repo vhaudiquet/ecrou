@@ -303,20 +303,33 @@ fn extract_prepared(
 /// guest has whatever the image shipped, which is usually nothing.
 /// Best effort: a rootfs with its own resolver config keeps it.
 fn provision_resolver(rootfs: &Path) {
-    let host = match std::fs::read_to_string("/etc/resolv.conf") {
-        Ok(s) if !s.trim().is_empty() => s,
+    // The engine proxies guest sockets to the host's stack, so any
+    // host-reachable nameserver works in the machine - but loopback
+    // addresses do not cross: 127.0.0.53 stays inside the guest, where
+    // nothing listens. So the source of truth is systemd-resolved's
+    // uplink config when present, and loopback nameservers are dropped
+    // from whatever is copied. Best effort: failures leave the
+    // image's file.
+    let host = match std::fs::read_to_string("/run/systemd/resolve/resolv.conf")
+        .or_else(|_| std::fs::read_to_string("/etc/resolv.conf"))
+    {
+        Ok(s) if !s.trim().is_empty() => drop_loopback_nameservers(&s),
         Ok(_) => {
-            log::debug!("host /etc/resolv.conf is empty; leaving the image's in place");
+            log::debug!("host resolver config is empty; leaving the image's in place");
             return;
         }
         Err(e) => {
             log::debug!(
-                "no host /etc/resolv.conf ({}); leaving the image's in place",
+                "no host resolver config ({}); leaving the image's in place",
                 e
             );
             return;
         }
     };
+    if !host.contains("nameserver ") {
+        log::debug!("host resolver config has no usable nameserver; leaving the image's");
+        return;
+    }
     let target = rootfs.join("etc/resolv.conf");
     if let Err(e) = std::fs::remove_file(&target) {
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -328,9 +341,28 @@ fn provision_resolver(rootfs: &Path) {
         let _ = std::fs::create_dir_all(parent);
     }
     match std::fs::write(&target, host) {
-        Ok(()) => log::debug!("provisioned the host resolver into {}", target.display()),
+        Ok(()) => log::debug!("provisioned a resolver into {}", target.display()),
         Err(e) => log::debug!("could not write {}: {}", target.display(), e),
     }
+}
+
+/// Lines naming a loopback nameserver go: the guest's loopback is its
+/// own, and the stub resolvers live on the host's.
+fn drop_loopback_nameservers(config: &str) -> String {
+    config
+        .lines()
+        .filter(|line| {
+            let rest = match line.trim_start().strip_prefix("nameserver ") {
+                Some(r) => r.trim(),
+                None => return true,
+            };
+            !rest.starts_with("127.")
+        })
+        .fold(String::new(), |mut acc, line| {
+            acc.push_str(line);
+            acc.push('\n');
+            acc
+        })
 }
 
 /// Write a tarball of `rootfs` at `dest`, compressed according to dest's
@@ -481,6 +513,23 @@ fn get_tarball_extension(url: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use super::drop_loopback_nameservers;
+
+    #[test]
+    fn loopback_nameservers_dropped() {
+        let config = "# comment\nnameserver 127.0.0.53\noptions edns0\nnameserver 192.168.1.1\nnameserver 127.0.0.1\n";
+        assert_eq!(
+            drop_loopback_nameservers(config),
+            "# comment\noptions edns0\nnameserver 192.168.1.1\n"
+        );
+        // A search line whose address-ish token is untouched.
+        let config = "search 127.example\nnameserver 10.0.0.1\n";
+        assert_eq!(
+            drop_loopback_nameservers(config),
+            "search 127.example\nnameserver 10.0.0.1\n"
+        );
+    }
+
     use super::*;
     use crate::progress::NoProgress;
     use std::os::unix::fs::PermissionsExt;
