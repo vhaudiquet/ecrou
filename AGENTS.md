@@ -31,6 +31,7 @@ Rules:
   - `cli` - entry point and flags (`crates/ecrou-cli/src/main.rs`,
     `crates/ecrou-cli/src/cli.rs`)
   - `vm` - the run flow, one-shot machines (`crates/ecrou/src/vm.rs`)
+  - `supervise` - machine process fork and wait (`crates/ecrou/src/supervise.rs`)
   - `krun` - the libkrun FFI (`crates/ecrou/src/krun.rs`)
   - `guest` - the guest init script (`crates/ecrou/src/guest.rs`)
   - `rootfs` - cache-aware preparation and persistence

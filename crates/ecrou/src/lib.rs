@@ -42,6 +42,7 @@ pub mod progress;
 mod registry;
 pub mod rootfs;
 pub mod spec;
+mod supervise;
 pub mod utils;
 pub mod vm;
 
