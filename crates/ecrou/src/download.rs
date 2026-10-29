@@ -96,8 +96,10 @@ async fn fetch_oci_digest_async(
     repository: &str,
     tag: &str,
 ) -> anyhow::Result<String> {
+    // Metadata call: a small body, so the read window alone bounds it.
     let client = Client::builder()
-        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(30))
         .build()
         .context("Failed to create HTTP client")?;
 
@@ -215,8 +217,10 @@ async fn fetch_published_checksum(distro: &Distro, tarball_url: &str) -> anyhow:
         return Err(anyhow!("no checksum artifact for {}", tarball_url));
     };
 
+    // Metadata call: a small body, so the read window alone bounds it.
     let client = Client::builder()
-        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(30))
         .build()
         .context("Failed to create HTTP client")?;
 
