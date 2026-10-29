@@ -1,0 +1,124 @@
+name: ecrou
+base: core26
+version: "0.1.0"
+summary: The strictly confined microVM runtime
+description: |
+  ecrou boots disposable Linux environments as one-shot microVMs on
+  libkrun: it resolves an image reference, boots one VM per command
+  with live stdio, propagates the exit code, and throws the machine
+  away. Persistence crosses an explicit `--share` or it does not
+  happen.
+
+  ## Confinement
+
+  The host process never mounts a filesystem and never creates or
+  enters a namespace, so the whole runtime runs inside snapd's
+  default-deny seccomp allowlist. Working KVM is required; there is
+  no software fallback.
+
+  ## First run
+
+  Connect the KVM interface (home and network connect on their own):
+
+      sudo snap connect ecrou:kvm
+
+  Then prove the machine:
+
+      ecrou run alpine -- uname -a
+
+  The guest kernel version differing from the host is the microVM
+  proof.
+
+  ## Diagnostics
+
+  `ecrou probe` reports what a run would find: KVM, libkrun, the
+  cache directory.
+
+  ## Where things live
+
+  - image cache: `~/snap/ecrou/common/cache/ecrou`
+  - config: `~/snap/ecrou/common/config/ecrou.yaml`
+
+  The home interface does not cover dotfiles, so the XDG
+  directories are redirected into the snap's common data area.
+license: MIT
+grade: stable
+confinement: strict
+
+platforms:
+  amd64:
+  arm64:
+  riscv64:
+
+apps:
+  ecrou:
+    command: bin/ecrou
+    command-chain: [command-chain/ecrou-env]
+    plugs:
+      - home
+      - network
+      - kvm
+
+parts:
+  ecrou:
+    plugin: rust
+    source: .
+    rust-channel: "1.98.1"
+    rust-path: [crates/ecrou-cli]
+    # aws-lc-sys (the rustls provider) drives cmake and perl at build
+    # time; the rust plugin already brings gcc, curl, git, pkg-config.
+    build-packages: [cmake, perl]
+    override-build: |
+      craftctl default
+      # The home interface stops at dotfiles, so ~/.cache and
+      # ~/.config are unreachable under strict confinement. Point the
+      # XDG lookups (the dirs crate honors these variables) into the
+      # snap's durable area, shared across refreshes.
+      mkdir -p "$CRAFT_PART_INSTALL/command-chain"
+      cat > "$CRAFT_PART_INSTALL/command-chain/ecrou-env" <<'EOF'
+      #!/bin/sh
+      XDG_CACHE_HOME="$SNAP_USER_COMMON/cache"
+      XDG_CONFIG_HOME="$SNAP_USER_COMMON/config"
+      export XDG_CACHE_HOME XDG_CONFIG_HOME
+      mkdir -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME"
+      exec "$@"
+      EOF
+      chmod 755 "$CRAFT_PART_INSTALL/command-chain/ecrou-env"
+
+  libkrun:
+    plugin: rust
+    source: https://github.com/containers/libkrun
+    source-type: git
+    source-tag: v1.19.7
+    source-depth: 1
+    rust-channel: "1.98.1"
+    override-build: |
+      # Build only the libkrun package; the rest of the workspace is
+      # the feature-gated device crates, not needed for the eleven
+      # stable-ABI calls ecrou makes. `net` is TSI, the guest
+      # networking.
+      cargo build --release -p libkrun --features net
+      # No distro the snap bases ship from publishes libkrun.so.1, so
+      # the soname layout is set up here the way `make install`
+      # would.
+      install -Dm755 target/release/libkrun.so \
+        "$CRAFT_PART_INSTALL/lib/libkrun.so.1.19.7"
+      ln -s libkrun.so.1.19.7 "$CRAFT_PART_INSTALL/lib/libkrun.so.1"
+
+  libkrunfw:
+    plugin: nil
+    # libkrunfw5 ships only in the current series' universe today,
+    # not in any LTS base, so the .deb comes straight from the pool.
+    # The library embeds its kernel and has no external symbols, so
+    # it runs on the base's older glibc. The generic amd64 build, not
+    # the amd64v3 flavor: the snap should not require AVX2.
+    build-packages: [curl]
+    override-pull: |
+      curl -fL -o libkrunfw5.deb \
+        https://archive.ubuntu.com/ubuntu/pool/universe/libk/libkrunfw/libkrunfw5_5.5.0+ds-1_amd64.deb
+      echo "924cd545080aaf5da66740d12a51b7a5cbd9a5c0b502d21cbef9bc82bf1c8b6b  libkrunfw5.deb" | sha256sum -c
+    override-build: |
+      dpkg -x libkrunfw5.deb unpack
+      install -Dm755 unpack/usr/lib/x86_64-linux-gnu/libkrunfw.so.5.5.0 \
+        "$CRAFT_PART_INSTALL/lib/libkrunfw.so.5.5.0"
+      ln -s libkrunfw.so.5.5.0 "$CRAFT_PART_INSTALL/lib/libkrunfw.so.5"
