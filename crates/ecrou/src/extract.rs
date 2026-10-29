@@ -410,30 +410,49 @@ fn extract_archive<R: std::io::Read>(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        // Handle whiteout files (OCI layer markers for deletions)
+        // Handle whiteout files (OCI layer markers for deletions).
+        // Whiteout paths come from the archive, so both branches resolve
+        // them through `safe_join` like every other entry: a crafted
+        // marker whose path or target climbs above the rootfs is
+        // skipped, never followed host-side.
         if filename == ".wh..wh..opq" {
             // Opaque whiteout: clear all previously-extracted content in the parent directory
             let parent = path.parent().unwrap_or(Path::new(""));
-            let dest_dir = dest.join(parent);
-            if dest_dir.symlink_metadata().is_ok() {
-                for child in std::fs::read_dir(&dest_dir)
-                    .with_context(|| format!("Failed to read {}", dest_dir.display()))?
-                {
-                    let child = child?;
-                    let child_path = child.path();
-                    remove_path(&child_path).with_context(|| {
-                        format!("Opaque whiteout: failed to remove {}", child_path.display())
-                    })?;
+            match safe_join(dest, parent) {
+                Some(dest_dir) => {
+                    if dest_dir.symlink_metadata().is_ok() {
+                        for child in std::fs::read_dir(&dest_dir)
+                            .with_context(|| format!("Failed to read {}", dest_dir.display()))?
+                        {
+                            let child = child?;
+                            let child_path = child.path();
+                            remove_path(&child_path).with_context(|| {
+                                format!(
+                                    "Opaque whiteout: failed to remove {}",
+                                    child_path.display()
+                                )
+                            })?;
+                        }
+                    }
                 }
+                None => log::debug!("skipping whiteout above the rootfs: {}", path.display()),
             }
             // Do not extract the .wh..wh..opq marker itself
         } else if let Some(real_name) = filename.strip_prefix(".wh.") {
-            // Regular whiteout: delete the named path from lower layers
+            // Regular whiteout: delete the named path from lower layers.
+            // The name joins the parent before the check, so a `.wh..`
+            // marker, whose target would be the parent directory
+            // itself, is refused like any path that climbs.
             let parent = path.parent().unwrap_or(Path::new(""));
-            let target = dest.join(parent).join(real_name);
-            if target.symlink_metadata().is_ok() {
-                remove_path(&target)
-                    .with_context(|| format!("Whiteout: failed to remove {}", target.display()))?;
+            match safe_join(dest, &parent.join(real_name)) {
+                Some(target) => {
+                    if target.symlink_metadata().is_ok() {
+                        remove_path(&target).with_context(|| {
+                            format!("Whiteout: failed to remove {}", target.display())
+                        })?;
+                    }
+                }
+                None => log::debug!("skipping whiteout above the rootfs: {}", path.display()),
             }
             // Do not extract the .wh.* marker itself
         } else if entry.header().entry_type().is_dir() {
@@ -508,6 +527,13 @@ mod tests {
     fn build_tar(path: &Path, entries: &[(&str, EntryType, u32, &[u8])]) {
         let file = File::create(path).unwrap();
         let mut ar = Builder::new(file);
+        build_tar_into(&mut ar, entries);
+        ar.finish().unwrap();
+    }
+
+    /// Append (path, entry-type, mode, payload) tuples to an open
+    /// archive; entry paths go through the builder's own validation.
+    fn build_tar_into(ar: &mut Builder<File>, entries: &[(&str, EntryType, u32, &[u8])]) {
         for (name, kind, mode, payload) in entries {
             let mut header = Header::new_gnu();
             header.set_size(if *kind == EntryType::Regular {
@@ -531,7 +557,6 @@ mod tests {
                 ar.append_data(&mut header, name, std::io::empty()).unwrap();
             }
         }
-        ar.finish().unwrap();
     }
 
     /// Fedora's ca-certificates ships etc/pki/ca-trust/extracted/pem/
@@ -680,6 +705,68 @@ mod tests {
             .unwrap()
             .ino();
         assert_eq!(link_ino, real_ino);
+    }
+
+    /// Whiteout markers delete inside the rootfs and never above it:
+    /// both a `..`-carrying marker path and a `.wh..` marker, whose
+    /// target is the parent directory itself, must be refused while the
+    /// ordinary markers still do their job.
+    #[test]
+    fn whiteouts_delete_inside_and_never_above_the_rootfs() {
+        let src = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, b"keep").unwrap();
+
+        let tarball = src.path().join("rootfs.tar");
+        let file = File::create(&tarball).unwrap();
+        let mut ar = Builder::new(file);
+        build_tar_into(
+            &mut ar,
+            &[
+                ("etc/", EntryType::Directory, 0o755, b""),
+                ("etc/passwd", EntryType::Regular, 0o644, b"old"),
+                // the ordinary marker: etc/passwd goes away
+                ("etc/.wh.passwd", EntryType::Regular, 0o0, b""),
+                // a marker whose target would be the parent directory
+                ("etc/.wh..", EntryType::Regular, 0o0, b""),
+                ("etc/motd", EntryType::Regular, 0o644, b"kept"),
+            ],
+        );
+        // A marker path climbing above the rootfs, written as a raw
+        // header: the builder refuses `..` names, an attacker's tar
+        // does not have to.
+        let mut header = Header::new_gnu();
+        header.set_entry_type(EntryType::Regular);
+        header.set_size(0);
+        header.set_mode(0o0);
+        let mut name = [0u8; 100];
+        name[..b"../.wh.victim.txt".len()].copy_from_slice(b"../.wh.victim.txt");
+        header.as_gnu_mut().unwrap().name = name;
+        header.set_cksum();
+        ar.append(&header, std::io::empty()).unwrap();
+        ar.finish().unwrap();
+
+        extract_tarball(&tarball, out.path(), &NoProgress).unwrap();
+
+        assert!(
+            !out.path().join("etc/passwd").exists(),
+            "the ordinary whiteout must remove its entry"
+        );
+        assert!(
+            out.path().join("etc/motd").exists(),
+            "other entries survive"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"keep",
+            "a whiteout above the rootfs must not touch the host"
+        );
+        assert!(
+            out.path().exists(),
+            "the `.wh..` marker must not delete the rootfs itself"
+        );
     }
 
     #[test]
