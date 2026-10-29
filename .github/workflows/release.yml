@@ -1,0 +1,54 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.check.outputs.release }}
+    steps:
+      # The tag filter accepts v1.2.3-rc1 too; only plain vX[.Y.Z] tags
+      # are releases, everything else makes this job a no-op so the
+      # publish job reports "skipped" instead of failing.
+      - id: check
+        run: |
+          if [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+(\.[0-9]+)*$ ]]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish-snap:
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stamp the tag version into the manifests
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = \".*\"/version = \"$v\"/" Cargo.toml
+          sed -i "s/^version: \".*\"/version: \"$v\"/" snap/snapcraft.yaml
+          grep -H '^version' Cargo.toml snap/snapcraft.yaml
+
+      - uses: snapcore/action-build@v1
+        id: build
+
+      # Requires the SNAP_STORE_LOGIN secret: the output of
+      #   snapcraft export-login --snaps ecrou --channels stable -
+      - uses: snapcore/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAP_STORE_LOGIN }}
+        with:
+          snap: ${{ steps.build.outputs.snap }}
+          release: stable
