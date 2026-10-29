@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::distro::{Distro, ImageSource};
-use crate::Result;
+use crate::{Error, Result};
 
 /// Path of the digest sidecar file for a cached OCI image.
 /// e.g. `foo.tar.gz` → `foo.tar.gz.digest`
@@ -445,16 +445,16 @@ async fn try_download_oci_image(
                 m_arch == arch && m_os == "linux"
             })
             .ok_or_else(|| {
-                // List available architectures in the error message
+                // The typed variant rides at the top of the chain, so it
+                // survives into `crate::Error` for consumers to match on.
                 let available: Vec<&str> = manifests
                     .iter()
                     .filter_map(|m| m["platform"]["architecture"].as_str())
                     .collect();
-                anyhow!(
-                    "No manifest found for architecture '{}'. Available: {}",
-                    arch,
-                    available.join(", ")
-                )
+                anyhow::Error::new(Error::ArchNotAvailable {
+                    arch: arch.to_string(),
+                    available: available.join(", "),
+                })
             })?;
 
         let manifest_digest = manifest_entry["digest"]

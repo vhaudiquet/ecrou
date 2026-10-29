@@ -13,7 +13,7 @@ use std::ffi::{c_char, CString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 
 use crate::Error;
 
@@ -304,18 +304,22 @@ pub fn kvm_probe() -> Result<()> {
         .read(true)
         .write(true)
         .open("/dev/kvm")
-        .map_err(|err| anyhow::Error::from(err).context(Error::KvmUnavailable.to_string()))?;
+        // The variant rides at the top of the chain so it survives the
+        // conversion into `crate::Error`; the open(2) error stays
+        // reachable as its source.
+        .map_err(|err| anyhow::Error::new(Error::KvmUnavailable(err)))?;
     // Safety: the fd is open and an ioctl on /dev/kvm with
     // KVM_GET_API_VERSION reads nothing; only the kernel writes the int
     // return.
     let ret = unsafe { libc::ioctl(file.as_raw_fd(), KVM_GET_API_VERSION) };
     if ret != KVM_API_VERSION_EXPECTED {
-        return Err(anyhow!(
-            "/dev/kvm reports API version {}, expected {}; the kernel module \
-             and the userspace disagree",
-            ret,
-            KVM_API_VERSION_EXPECTED
-        ));
+        return Err(anyhow::Error::new(Error::KvmUnavailable(
+            std::io::Error::other(format!(
+                "/dev/kvm reports API version {}, expected {}; the kernel module \
+                 and the userspace disagree",
+                ret, KVM_API_VERSION_EXPECTED
+            )),
+        )));
     }
     Ok(())
 }
