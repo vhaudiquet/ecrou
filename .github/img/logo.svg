@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img">
+  <title>écrou</title>
+  <desc>A steel hex nut: rounded hexagonal body, chamfered top face, threaded hole at the center.</desc>
+  <defs>
+    <linearGradient id="side" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5a6675"/>
+      <stop offset="1" stop-color="#2b323c"/>
+    </linearGradient>
+    <linearGradient id="top" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9aa8b8"/>
+      <stop offset="1" stop-color="#616f7e"/>
+    </linearGradient>
+  </defs>
+
+  <!-- hex body, hole cut through -->
+  <path fill="url(#side)" fill-rule="evenodd" d="
+    M121.07 36
+    A14 14 0 0 1 134.93 36
+    L204.21 76
+    A14 14 0 0 1 204.21 88
+    L204.21 168
+    A14 14 0 0 1 204.21 180
+    L134.93 220
+    A14 14 0 0 1 121.07 220
+    L51.79 180
+    A14 14 0 0 1 51.79 168
+    L51.79 88
+    A14 14 0 0 1 51.79 76
+    Z
+    M168 128 A40 40 0 1 0 88 128 A40 40 0 1 0 168 128
+    Z"/>
+
+  <!-- chamfered top face, same hole -->
+  <path fill="url(#top)" fill-rule="evenodd" d="
+    M50 128 A78 78 0 1 0 206 128 A78 78 0 1 0 50 128
+    Z
+    M168 128 A40 40 0 1 0 88 128 A40 40 0 1 0 168 128
+    Z"/>
+
+  <!-- shadow ring where the hole meets the face -->
+  <circle cx="128" cy="128" r="43.5" fill="none" stroke="#20272f" stroke-width="5" opacity="0.45"/>
+
+  <!-- light catch along the top chamfer -->
+  <path d="M78.5 78.5 A70 70 0 0 1 177.5 78.5" fill="none"
+        stroke="#ffffff" stroke-width="7" stroke-linecap="round" opacity="0.28"/>
+</svg>
