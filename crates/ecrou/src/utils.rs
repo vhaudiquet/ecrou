@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 
 use crate::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ============================================================================
 // Constants
@@ -33,6 +33,23 @@ pub fn random_suffix(len: usize) -> String {
             CHARS[(state >> 33) as usize % CHARS.len()] as char
         })
         .collect()
+}
+
+// ============================================================================
+// Unique scratch paths for atomic writes
+// ============================================================================
+
+/// Sequence counter for [`partial_path`], unique within the process.
+static PARTIAL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A sibling scratch path for writing `dest` before an atomic rename:
+/// the pid separates concurrent processes, the sequence separates
+/// threads. Two writers racing on the same cache entry each complete
+/// their own file, so whichever rename lands last, the bytes at `dest`
+/// are whole.
+pub fn partial_path(dest: &Path) -> PathBuf {
+    let seq = PARTIAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    dest.with_extension(format!("partial.{}-{seq}", std::process::id()))
 }
 
 // ============================================================================

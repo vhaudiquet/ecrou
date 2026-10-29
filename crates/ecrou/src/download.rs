@@ -302,12 +302,15 @@ async fn download_file_async(
         (total_size > 0).then_some(total_size),
     );
 
-    let temp_dest = dest.with_extension("partial");
+    // Unique per call: concurrent runs writing the same entry each
+    // complete their own file, and the last rename wins with whole
+    // bytes either way.
+    let temp_dest = crate::utils::partial_path(dest);
 
     // Download into the temp file, then atomically rename to the final path.
     // Verification runs before the rename so a corrupted download never
     // reaches the cache; on any failure after the temp file is created we
-    // remove it so stale .partial files don't accumulate.
+    // remove it so stale partial files don't accumulate.
     let mut hasher = DownloadHasher::new();
     let result: anyhow::Result<()> = async {
         let mut file = tokio::fs::File::create(&temp_dest)
@@ -579,7 +582,7 @@ async fn try_download_oci_image(
 
     // Bundle layers.manifest + all layer blobs into a single .tar.gz cache file
     // using the tar + flate2 crates — no external `tar` binary required.
-    let temp_dest = dest.with_extension("tar.partial");
+    let temp_dest = crate::utils::partial_path(dest);
 
     let bundle_result: anyhow::Result<()> = (|| {
         use flate2::{write::GzEncoder, Compression};

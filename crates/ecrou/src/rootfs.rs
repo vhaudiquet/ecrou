@@ -136,8 +136,14 @@ impl RootfsCache {
         let dir = self.dir.join("layers");
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("Failed to create the layer directory {}", dir.display()))?;
-        std::fs::write(dir.join(name), cache_filename)
+        // Atomic write: a concurrent run reading the pointer must
+        // never see a truncated filename mid-write.
+        let pointer = dir.join(name);
+        let partial = crate::utils::partial_path(&pointer);
+        std::fs::write(&partial, cache_filename)
             .with_context(|| format!("Failed to write the layer pointer for {name}"))?;
+        std::fs::rename(&partial, &pointer)
+            .with_context(|| format!("Failed to move the layer pointer into place for {name}"))?;
         Ok(())
     }
 
@@ -522,7 +528,7 @@ fn drop_loopback_nameservers(config: &str) -> String {
 
 /// Write a tarball of `rootfs` at `dest`, compressed according to dest's
 /// extension (.tar.gz, .tar.xz, .tar.zst, plain .tar), atomically via a
-/// `.partial` file.
+/// unique partial file ([`crate::utils::partial_path`]).
 fn pack_rootfs(rootfs: &Path, dest: &Path) -> anyhow::Result<()> {
     // Packing the tree into a tarball placed inside it would recurse
     // forever: the walker keeps seeing the archive grow.
@@ -541,7 +547,7 @@ fn pack_rootfs(rootfs: &Path, dest: &Path) -> anyhow::Result<()> {
     }
 
     let filename = dest.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let partial = dest.with_extension("partial");
+    let partial = crate::utils::partial_path(dest);
 
     let file = std::fs::File::create(&partial)
         .with_context(|| format!("Failed to create {}", partial.display()))?;
@@ -848,12 +854,21 @@ mod tests {
 
     #[test]
     fn pack_failure_leaves_no_partial_file() {
-        // A nonexistent rootfs must fail cleanly and clean up the .partial
+        // A nonexistent rootfs must fail cleanly and clean up its
+        // partial file, whatever unique name it carried.
         let cache = tempfile::tempdir().unwrap();
         let dest = cache.path().join("x.tar.gz");
         assert!(pack_rootfs(Path::new("/nonexistent-rootfs"), &dest).is_err());
         assert!(!dest.exists());
-        assert!(!dest.with_extension("partial").exists());
+        let leftovers: Vec<String> = std::fs::read_dir(cache.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("partial"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "partial files left behind: {leftovers:?}"
+        );
     }
 
     #[test]
