@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
 
-use crate::distro::{map_arch, resolve_distro_url, resolve_source, Distro, ImageSource};
+use crate::distro::{map_arch, resolve_source, Distro, ImageSource};
 use crate::download::{digest_sidecar, download_image};
 use crate::error::Error;
 use crate::extract::extract_tarball;
@@ -377,20 +377,18 @@ fn generate_cache_filename(source: &ImageSource, arch: &str) -> String {
                 Distro::Alpine => "alpine",
             };
             let distro_arch = map_arch(*distro, arch);
-            // The extension comes from the URL. `version` is the
-            // resolved value (resolve_source ran first), so this
-            // derivation is offline: numbers and patch-resolved
-            // strings pass through without lookups. A resolution
-            // failure here degrades to the plain .tar.gz name rather
-            // than blocking every cache-path computation.
-            let url = resolve_distro_url(distro, version.as_deref(), arch).unwrap_or_default();
-            let ext = get_tarball_extension(&url);
+            // Pure naming: no URL resolution, no network, ever — a
+            // path derivation is a string shape, not an I/O decision.
+            // The version here is whatever the caller carries
+            // (resolve_source resolves before prepare, so internal
+            // paths always name numbers). Dist artifacts are gzipped
+            // tarballs; a new artifact format changes extraction and
+            // this line together.
             format!(
-                "{}-{}-{}.{}",
+                "{}-{}-{}.tar.gz",
                 distro_name,
                 version.as_deref().unwrap_or("latest"),
                 distro_arch,
-                ext
             )
         }
         ImageSource::OciImage {
@@ -604,20 +602,5 @@ mod tests {
             cache.layer_entry("w").expect("reads").is_some(),
             "pointer + entry + marker resolve"
         );
-    }
-}
-
-fn get_tarball_extension(url: &str) -> &str {
-    // Extract extension from URL (e.g., .tar.gz, .tar.xz, .tar.zst)
-    if url.ends_with(".tar.zst") {
-        "tar.zst"
-    } else if url.ends_with(".tar.xz") {
-        "tar.xz"
-    } else if url.ends_with(".tar.gz") {
-        "tar.gz"
-    } else if url.ends_with(".tar.bz2") {
-        "tar.bz2"
-    } else {
-        "tar.gz" // default
     }
 }
