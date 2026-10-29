@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::{anyhow, Context};
 
 use crate::Result;
@@ -24,6 +26,10 @@ pub enum ImageSource {
         tag: String,
         architecture: String,
     },
+    /// A rootfs archive on the host filesystem, named with a path
+    /// ("./rootfs.tar.gz", "/tmp/rootfs.tar"): read directly at prepare
+    /// time, never downloaded and never cached as a pristine entry.
+    LocalTarball { path: PathBuf },
 }
 
 impl Distro {
@@ -51,6 +57,16 @@ pub fn parse_image_ref(input: &str, arch: &str) -> Result<ImageSource> {
         .or_else(|| input.strip_prefix("oci://"))
     {
         return Ok(parse_oci_ref(rest, arch)?);
+    }
+
+    // A reference that names a path stays a path: "./x", "../x" and
+    // "/x" can never be a distro name or an OCI reference, and the
+    // shell hands unexpanded "~" over only when quoted, which is
+    // deliberate. Everything else with a '/' is a registry ref.
+    if input.starts_with("./") || input.starts_with("../") || input.starts_with('/') {
+        return Ok(ImageSource::LocalTarball {
+            path: PathBuf::from(input),
+        });
     }
 
     // Check for registry prefix (contains /)
@@ -529,6 +545,33 @@ mod tests {
             url.contains("minirootfs-20250401-"),
             "expected URL to contain 'minirootfs-20250401-' but got: {}",
             url
+        );
+    }
+
+    #[test]
+    fn a_dotted_relative_reference_names_a_local_tarball() {
+        let local = |p: &str| ImageSource::LocalTarball {
+            path: std::path::PathBuf::from(p),
+        };
+        let src = parse_image_ref("./rootfs.tar.gz", "amd64").expect("parses");
+        assert_eq!(src, local("./rootfs.tar.gz"));
+        assert_eq!(
+            parse_image_ref("../images/rootfs.tar", "amd64").expect("parses"),
+            local("../images/rootfs.tar")
+        );
+        assert_eq!(
+            parse_image_ref("/tmp/rootfs.tar.zst", "amd64").expect("parses"),
+            local("/tmp/rootfs.tar.zst")
+        );
+    }
+
+    #[test]
+    fn path_like_registry_references_are_never_local_files() {
+        // A leading path component that is a hostname stays OCI: only
+        // "./", "../" and "/" introduce a local archive.
+        assert_eq!(
+            parse("mydir/image"),
+            oci("docker.io", "mydir/image", "latest")
         );
     }
 }

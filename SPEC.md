@@ -132,8 +132,9 @@ of the image (a `PreparedRootfs`, TempDir-backed): it exists only for
 the run and dies with it. Persistence crosses a workspace share or it
 does not happen.
 
-**Workspace shares.** `--share HOST:GUEST[:ro]`, one virtiofs share per
-entry (`krun_add_virtiofs`, `krun_set_root` keeps the rootfs itself).
+**Workspace shares.** `-v HOST:GUEST[:ro]` (`--volume`), one virtiofs
+share per entry (`krun_add_virtiofs`, `krun_set_root` keeps the rootfs
+itself).
 The host side is plain fs; the guest init mounts each share at its
 guest path. There is no implicit share: an empty sandbox is the
 default, and the consumer chooses what crosses. This is deliberate; a
@@ -174,15 +175,36 @@ machine with it. No orphan survives. This is stronger than `docker
 exec`'s cancel, which kills only the local client; the tests keep it
 true (T4).
 
-**Console.** Guest output reaches real stdout through a console file
-the parent streams while the machine runs, with a final drain after
-the reap. The direct stdio wiring does not survive contact with
-reality: with a tty on fd 0 libkrun's terminal setup stops a
+**Console.** Three wirings, chosen by the run's flags.
+
+Headless (the default): guest output reaches real stdout through a
+console file the parent streams while the machine runs, with a final
+drain after the reap. The direct stdio wiring does not survive contact
+with reality: with a tty on fd 0 libkrun's terminal setup stops a
 background caller with SIGTTOU, and without one its console bytes go
 to the log sink, not the terminal. The child therefore unwires fd 0 to
-/dev/null (v1 carries no guest input; a Ctrl-C to the process group is
-still forwarded into the guest). There is no QEMU monitor to mux;
-`--verbose` maps to `krun_set_log_level`.
+/dev/null (no guest input; a Ctrl-C to the process group is still
+forwarded into the guest).
+
+`-t`: the machine owns the terminal. With no console output file set,
+libkrun wires the guest console to the process's own stdin and stdout,
+puts the tty in raw mode, and restores it through its exit observers.
+The parent additionally saves and restores the termios around the run:
+the observers do not run in a SIGKILLed machine. Input is the typed
+keyboard; Ctrl-C reaches the guest as a byte (raw mode has no ISIG)
+and the guest's line discipline signals its own foreground job. The
+run refuses to start without a terminal on stdin and stdout, and
+`--capture` is refused with `-t` (the payload's streams cannot land in
+files and on the terminal at once).
+
+`-i` without `-t`: pipes. libkrun still owns the process stdio, and
+its non-tty streams surface in the guest as virtio console ports
+(`krun-stdin`, `krun-stdout`, `krun-stderr` under `/dev/virtio-ports`);
+the guest init re-points the payload's stdio onto whichever port nodes
+exist, so `echo hi | ecrou run -i alpine -- cat` crosses the machine.
+A stream the host left on a tty has no port node and stays on the
+console. There is no QEMU monitor to mux; `--verbose` maps to
+`krun_set_log_level`.
 
 **Networking.** TSI, libkrun's default: the guest has no interface, and
 its socket calls are proxied on the host's stack by the VMM process.
@@ -232,7 +254,8 @@ absent kernel entries only.
 ```rust
 pub struct Share { pub host: PathBuf, pub guest: String, pub read_only: bool }
 pub struct RunOptions {
-    pub image: String,          // distro ref or OCI image ref
+    pub image: String,          // distro ref, OCI image ref, or local
+                                // rootfs archive path (./x.tar.gz)
     pub arch: String,           // empty = host arch
     pub memory: String,         // default "1G"
     pub workspace: Option<Share>,   // the one rw share consumers name
@@ -241,6 +264,8 @@ pub struct RunOptions {
     pub workdir: String,        // guest cwd; empty = /
     pub env: Vec<(String, String)>, // composed envp; host env never inherited
     pub hostname: String,       // empty = generated ecrou-vm-XXXXXX
+    pub interactive: bool,      // host stdin feeds the guest
+    pub tty: bool,              // console on the terminal (implies interactive)
     pub log_level: LogLevel,    // Quiet | Normal | Verbose
     pub capture: Option<PathBuf>,   // payload stdout/stderr into files
 }
@@ -273,16 +298,24 @@ ecrou provision [OPTIONS] <IMAGE> [-- COMMAND...]
 ecrou probe
 ```
 
+The image is a distro name (`alpine`, `ubuntu:noble`), an OCI
+reference (`ghcr.io/org/image:tag`), or a local rootfs archive named
+with a path (`./rootfs.tar.gz`, `/tmp/rootfs.tar`): a path reference is
+read in place on every run, never downloaded and never cached as a
+pristine entry.
+
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--share <HOST:GUEST[:ro]>` | none | Workspace share; repeatable |
+| `-i, --interactive` | false | Keep the machine's stdin open: the host's stdin feeds the guest |
+| `-t, --tty` | false | Console on the terminal: raw mode, the guest sees a tty (implies `-i`; needs a terminal on stdin and stdout) |
+| `-v, --volume <HOST:GUEST[:ro]>` | none | Share a directory into the machine; the first rw one is the workspace; repeatable |
 | `-m, --memory <size>` | 1G | Guest memory |
-| `--workdir <guest path>` | `/` | Guest cwd |
+| `-w, --workdir <guest path>` | `/` | Guest cwd |
 | `-e, --env <KEY=VALUE>` | none | Guest env; repeatable |
 | `--quiet` | false | Suppress kernel log on the console |
-| `--capture <DIR>` | none | Payload stdout/stderr into `<DIR>/stdout` and `<DIR>/stderr` |
-| `--no-cache` | false | Fresh download, ignore the cache |
-| `-v, --verbose` | false | Diagnostics; raises the libkrun log level |
+| `--capture <DIR>` | none | Payload stdout/stderr into `<DIR>/stdout` and `<DIR>/stderr`; incompatible with `-t` |
+| `--no-cache` | false | Fresh download, ignore the cache (a local archive is always read fresh) |
+| `--verbose` | false | Diagnostics; raises the libkrun log level |
 
 `ecrou provision IMAGE -- COMMAND` bakes a command into the image's
 cache entry: the command runs in a machine over a freshly prepared

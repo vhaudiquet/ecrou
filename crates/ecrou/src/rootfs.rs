@@ -112,7 +112,7 @@ impl RootfsCache {
         let arch = std::env::consts::ARCH
             .replace("x86_64", "amd64")
             .replace("aarch64", "arm64");
-        extract_prepared(path, arch, progress).map_err(Error::Other)
+        extract_prepared(&path.clone(), path, arch, progress).map_err(Error::Other)
     }
 
     /// The cache path an image resolves to, keyed or not — the same
@@ -168,6 +168,23 @@ impl RootfsCache {
     pub fn prepare(&self, req: &PrepareRequest, progress: &dyn Progress) -> Result<PreparedRootfs> {
         let arch = req.resolved_arch();
         let source = resolve_source(&req.image, &arch)?;
+
+        // A local archive bypasses the cache: the file is the pristine
+        // source on every run (--no-cache has nothing to say about it),
+        // and the derived entry name only matters as the place a
+        // provisioning over it would persist into.
+        if let ImageSource::LocalTarball { path } = &source {
+            if !path.is_file() {
+                return Err(Error::Other(anyhow!(
+                    "local rootfs archive not found: {} (a reference naming a path \
+                     must be a rootfs tarball: ./rootfs.tar.gz)",
+                    path.display()
+                )));
+            }
+            let entry = self.tarball_path(&source, &arch);
+            return extract_prepared(path, entry, arch, progress).map_err(Error::Other);
+        }
+
         let cache_path = self.tarball_path(&source, &arch);
 
         // OCI images with a floating tag (":latest") need a freshness check:
@@ -228,7 +245,12 @@ impl RootfsCache {
             log::debug!("Using cached tarball: {}", cache_path.display());
         }
 
-        Ok(extract_prepared(cache_path, arch, progress)?)
+        Ok(extract_prepared(
+            &cache_path.clone(),
+            cache_path,
+            arch,
+            progress,
+        )?)
     }
 
     /// Prepare a provisioned rootfs with cache amortization: when the cache
@@ -259,7 +281,12 @@ impl RootfsCache {
 
         if !req.no_cache && cache_path.exists() && marker.exists() {
             log::debug!("Using provisioned cache entry: {}", cache_path.display());
-            return Ok(extract_prepared(cache_path, arch, progress)?);
+            return Ok(extract_prepared(
+                &cache_path.clone(),
+                cache_path,
+                arch,
+                progress,
+            )?);
         }
 
         // The miss path prepares the PRISTINE base — a keyed entry
@@ -406,6 +433,7 @@ fn resolve_source(image: &str, arch: &str) -> anyhow::Result<ImageSource> {
 }
 
 fn extract_prepared(
+    source: &Path,
     cache_path: PathBuf,
     arch: String,
     progress: &dyn Progress,
@@ -414,7 +442,7 @@ fn extract_prepared(
     let rootfs = temp.path().to_path_buf();
 
     log::debug!("Extracting to: {}", rootfs.display());
-    extract_tarball(&cache_path, &rootfs, progress)?;
+    extract_tarball(source, &rootfs, progress)?;
     provision_resolver(&rootfs);
 
     Ok(PreparedRootfs {
@@ -620,6 +648,26 @@ fn generate_cache_filename(source: &ImageSource, arch: &str) -> String {
                 safe_registry, safe_repo, tag, architecture
             )
         }
+        ImageSource::LocalTarball { path } => {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("rootfs")
+                .replace(['/', '\\', ':'], "_");
+            // Size and mtime key the entry: a provisioning over a
+            // local archive persists into the cache under this name,
+            // never over the caller's file, and an edited archive
+            // lands in a fresh entry.
+            let meta = std::fs::metadata(path);
+            let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let mtime = meta
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            format!("local-{}-{:x}-{:x}.tar.gz", stem, len, mtime)
+        }
     }
 }
 
@@ -806,6 +854,71 @@ mod tests {
         assert!(pack_rootfs(Path::new("/nonexistent-rootfs"), &dest).is_err());
         assert!(!dest.exists());
         assert!(!dest.with_extension("partial").exists());
+    }
+
+    #[test]
+    fn a_local_archive_prepares_without_touching_the_cache() {
+        // A rootfs tree, packed next to itself as ./rootfs.tar.gz, the
+        // way a caller names a local archive.
+        let work = tempfile::tempdir().unwrap();
+        let tree = work.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("etc-marker"), b"local").unwrap();
+        let tarball = work.path().join("rootfs.tar.gz");
+        pack_rootfs(&tree, &tarball).unwrap();
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = RootfsCache::new(cache_dir.path().to_path_buf());
+        // An absolute spelling: "./" would resolve against this test
+        // process's working directory, not the tempdir.
+        let req = PrepareRequest::new(tarball.to_str().unwrap());
+        let rootfs = cache.prepare(&req, &NoProgress).expect("prepares");
+        assert_eq!(
+            std::fs::read(rootfs.dir().join("etc-marker")).unwrap(),
+            b"local"
+        );
+        // Nothing was downloaded or stashed: the file is the source.
+        assert!(cache_dir.path().read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn a_missing_local_archive_is_a_named_error() {
+        let cache = RootfsCache::new(std::env::temp_dir().join("ecrou-test-absent"));
+        let req = PrepareRequest::new("./definitely-not-here.tar.gz");
+        let err = format!("{:#}", cache.prepare(&req, &NoProgress).unwrap_err());
+        assert!(err.contains("definitely-not-here.tar.gz"), "{err}");
+        assert!(err.contains("local rootfs archive"), "{err}");
+    }
+
+    #[test]
+    fn a_local_archive_keys_its_derived_entry_by_size_and_mtime() {
+        let source = crate::distro::parse_image_ref("./rootfs.tar.gz", "amd64").expect("parses");
+        let cache = RootfsCache::new(std::path::PathBuf::from("/cache"));
+        let name = cache.tarball_path(&source, "amd64");
+        let name = name.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("local-rootfs.tar-"), "{name}");
+        assert!(name.ends_with(".tar.gz"), "{name}");
+        // A zero-length archive keys differently from a one-byte one:
+        // an edited file never lands in a stale derived entry.
+        let empty = tempfile::NamedTempFile::new().unwrap();
+        let source = crate::distro::parse_image_ref(empty.path().to_str().unwrap(), "amd64")
+            .expect("parses");
+        let empty_name = cache
+            .tarball_path(&source, "amd64")
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        std::fs::write(empty.path(), b"x").unwrap();
+        let grown = cache
+            .tarball_path(&source, "amd64")
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(empty_name, grown);
     }
 
     #[test]

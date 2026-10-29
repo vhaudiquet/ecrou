@@ -10,7 +10,7 @@ use clap::Parser;
 use ecrou::vm::RunOptions;
 use ecrou::{LogLevel, NoProgress, Progress};
 
-use cli::{parse_env, parse_share, Cli, Command, RunArgs};
+use cli::{parse_env, parse_volume, Cli, Command, RunArgs};
 use progress::TermProgress;
 
 fn main() -> std::process::ExitCode {
@@ -157,6 +157,15 @@ fn cmd_provision(
 }
 
 fn cmd_run(args: &RunArgs, cli_verbose: bool) -> std::process::ExitCode {
+    // A tty drives the payload's output through the terminal while the
+    // capture share points the same streams at files: one of them has
+    // to lose, so the run refuses instead of picking.
+    if args.tty && args.capture.is_some() {
+        return fail(&anyhow::anyhow!(
+            "--capture and --tty cannot be combined: the payload's output \
+             cannot land in the capture files and on the terminal"
+        ));
+    }
     let mut options = RunOptions {
         // Without a layer the image is required by clap; with one the
         // field is dead — the layer entry carries the rootfs.
@@ -171,6 +180,8 @@ fn cmd_run(args: &RunArgs, cli_verbose: bool) -> std::process::ExitCode {
         } else {
             LogLevel::Normal
         },
+        interactive: args.interactive,
+        tty: args.tty,
         no_cache: args.no_cache,
         layer: args.layer.clone(),
         capture: args.capture.clone(),
@@ -183,8 +194,8 @@ fn cmd_run(args: &RunArgs, cli_verbose: bool) -> std::process::ExitCode {
         }
     }
     let mut shares = Vec::new();
-    for spec in &args.shares {
-        match parse_share(spec) {
+    for spec in &args.volumes {
+        match parse_volume(spec) {
             Ok(share) => shares.push(share),
             Err(err) => return fail(&err),
         }

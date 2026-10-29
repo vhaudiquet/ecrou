@@ -35,6 +35,27 @@ pub struct GuestCapture {
     pub stderr: String,
 }
 
+/// How the payload's stdio reaches the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestStdio {
+    /// The guest console. The default: a tty machine gives the payload
+    /// a terminal, the headless machine points it at the streamed
+    /// console file.
+    Console,
+    /// Host pipes. An interactive machine without a terminal: libkrun
+    /// exposes the run's non-tty stdio streams as virtio console ports
+    /// (`krun-stdin`, `krun-stdout`, `krun-stderr`), and the init wires
+    /// whichever port nodes exist onto the payload, leaving any tty
+    /// stream on the console.
+    HostPipes,
+}
+
+/// The virtio port names libkrun gives the implicit console's pipe
+/// streams (its builder, `autoconfigure_console_ports`).
+pub const PORT_STDIN: &str = "/dev/virtio-ports/krun-stdin";
+pub const PORT_STDOUT: &str = "/dev/virtio-ports/krun-stdout";
+pub const PORT_STDERR: &str = "/dev/virtio-ports/krun-stderr";
+
 /// Shell-quote a string for safe interpolation into the init script.
 /// Single quotes wrap everything; an embedded single quote closes,
 /// escapes, and reopens.
@@ -50,6 +71,7 @@ pub fn init_script(
     payload: &[String],
     workdir: &str,
     hostname: &str,
+    stdio: GuestStdio,
     capture: Option<&GuestCapture>,
 ) -> String {
     let mut script = String::from(
@@ -92,6 +114,24 @@ pub fn init_script(
         "cd {} || exit 126\n\n",
         sh_quote(if workdir.is_empty() { "/" } else { workdir })
     ));
+
+    // Host pipes: re-point the init shell's own stdio, per stream, at
+    // whichever port nodes libkrun created. A stream the host left on
+    // a tty has no port node and stays on the console. When /dev is
+    // empty (no devtmpfs automount) the port nodes cannot exist, so
+    // mount it first; best effort.
+    if stdio == GuestStdio::HostPipes {
+        script.push_str(
+            "if [ ! -e /dev/null ]; then mount -t devtmpfs devtmpfs /dev 2>/dev/null || true; fi\n",
+        );
+        for (node, redirect) in [(PORT_STDIN, "0<"), (PORT_STDOUT, "1>"), (PORT_STDERR, "2>")] {
+            script.push_str(&format!(
+                "if [ -c '{}' ]; then exec {}'{}'; fi\n",
+                node, redirect, node
+            ));
+        }
+        script.push('\n');
+    }
 
     // Captured runs wrap the payload in a redirection group: the
     // streams cross the capture share as files, and the group's exit
@@ -151,7 +191,14 @@ mod tests {
                 read_only: true,
             },
         ];
-        let script = init_script(&shares, &["true".to_string()], "/", "ecrou-vm-x", None);
+        let script = init_script(
+            &shares,
+            &["true".to_string()],
+            "/",
+            "ecrou-vm-x",
+            GuestStdio::Console,
+            None,
+        );
         assert!(script.contains("mount_share 'ws0' '/workspace' 'rw'"));
         assert!(script.contains("mount_share 'sk1' '/mnt/skills' 'ro'"));
     }
@@ -163,7 +210,7 @@ mod tests {
             "-c".to_string(),
             "echo $HOME; rm -rf '/'".to_string(),
         ];
-        let script = init_script(&[], &payload, "/", "ecrou-vm-x", None);
+        let script = init_script(&[], &payload, "/", "ecrou-vm-x", GuestStdio::Console, None);
         assert!(script.contains(r"'/bin/bash' '-c' 'echo $HOME; rm -rf '\''/'\''' "));
         // The payload line must appear after the cd and before the code
         // capture, so its exit code is what gets written.
@@ -175,7 +222,14 @@ mod tests {
 
     #[test]
     fn writes_exit_code_then_exits() {
-        let script = init_script(&[], &["true".to_string()], "/work", "ecrou-vm-x", None);
+        let script = init_script(
+            &[],
+            &["true".to_string()],
+            "/work",
+            "ecrou-vm-x",
+            GuestStdio::Console,
+            None,
+        );
         assert!(script.contains(&format!("echo \"$code\" > '{}'", EXIT_FILE)));
         // The file write must precede the exit: it is the only
         // diagnostic when a boot dies without the init running.
@@ -191,7 +245,14 @@ mod tests {
 
     #[test]
     fn hostname_lands_in_proc_and_etc() {
-        let script = init_script(&[], &["true".to_string()], "/", "ecrou-vm-x", None);
+        let script = init_script(
+            &[],
+            &["true".to_string()],
+            "/",
+            "ecrou-vm-x",
+            GuestStdio::Console,
+            None,
+        );
         assert!(script.contains("echo 'ecrou-vm-x' > /proc/sys/kernel/hostname"));
         assert!(script.contains("echo 'ecrou-vm-x' > /etc/hostname"));
     }
@@ -207,6 +268,7 @@ mod tests {
             &["true".to_string()],
             "/work",
             "ecrou-vm-x",
+            GuestStdio::Console,
             Some(&cap),
         );
         // The payload line is a redirection group: the group's exit
@@ -218,18 +280,96 @@ mod tests {
     }
 
     #[test]
+    fn host_pipes_wire_each_stream_that_has_a_port() {
+        let script = init_script(
+            &[],
+            &["cat".to_string()],
+            "/",
+            "ecrou-vm-x",
+            GuestStdio::HostPipes,
+            None,
+        );
+        assert!(script.contains(
+            "if [ -c '/dev/virtio-ports/krun-stdin' ]; then exec 0<'/dev/virtio-ports/krun-stdin'; fi"
+        ));
+        assert!(script.contains(
+            "if [ -c '/dev/virtio-ports/krun-stdout' ]; then exec 1>'/dev/virtio-ports/krun-stdout'; fi"
+        ));
+        assert!(script.contains(
+            "if [ -c '/dev/virtio-ports/krun-stderr' ]; then exec 2>'/dev/virtio-ports/krun-stderr'; fi"
+        ));
+        // A tty stream has no port node; the console fallback is the
+        // absence of the redirect, not a conditional mount of anything.
+        assert!(!script.contains("exec 0<'/dev/console'"));
+        // The wiring precedes the payload, whose fds it is.
+        let wire_at = script.find("exec 0<").unwrap();
+        let payload_at = script.find("'cat'").unwrap();
+        assert!(wire_at < payload_at);
+    }
+
+    #[test]
+    fn the_console_stdio_adds_no_wiring() {
+        let script = init_script(
+            &[],
+            &["true".to_string()],
+            "/",
+            "ecrou-vm-x",
+            GuestStdio::Console,
+            None,
+        );
+        assert!(!script.contains("virtio-ports"));
+        assert!(!script.contains("devtmpfs"));
+    }
+
+    #[test]
+    fn capture_survives_the_pipe_wiring() {
+        let cap = GuestCapture {
+            stdout: CAPTURE_STDOUT.into(),
+            stderr: CAPTURE_STDERR.into(),
+        };
+        let script = init_script(
+            &[],
+            &["true".to_string()],
+            "/",
+            "x",
+            GuestStdio::HostPipes,
+            Some(&cap),
+        );
+        // The redirection group overrides the shell-level exec for
+        // stdout and stderr; stdin stays on the port.
+        assert!(script.contains("{ 'true' ; } > '/.ecrou-io/stdout' 2> '/.ecrou-io/stderr' "));
+        let wire_at = script.find("exec 1>").unwrap();
+        let group_at = script.find("{ 'true'").unwrap();
+        assert!(wire_at < group_at);
+    }
+
+    #[test]
     fn capture_paths_are_quoted_like_any_operand() {
         let cap = GuestCapture {
             stdout: "/.ecrou-io/stdout".into(),
             stderr: "/.ecrou-io/stderr".into(),
         };
-        let script = init_script(&[], &["echo it's".to_string()], "/", "x", Some(&cap));
+        let script = init_script(
+            &[],
+            &["echo it's".to_string()],
+            "/",
+            "x",
+            GuestStdio::Console,
+            Some(&cap),
+        );
         assert!(script.contains("echo it'\\''s"));
     }
 
     #[test]
     fn empty_workdir_falls_back_to_root() {
-        let script = init_script(&[], &["true".to_string()], "", "ecrou-vm-x", None);
+        let script = init_script(
+            &[],
+            &["true".to_string()],
+            "",
+            "ecrou-vm-x",
+            GuestStdio::Console,
+            None,
+        );
         assert!(script.contains("cd '/'"));
     }
 }

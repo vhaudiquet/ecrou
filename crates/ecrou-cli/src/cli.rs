@@ -7,13 +7,13 @@ use clap::{Args, Parser, Subcommand};
     name = "ecrou",
     version,
     about = "One-shot microVM environments on libkrun",
-    after_help = "Run 'ecrou run IMAGE -- COMMAND' to boot a machine for one command."
+    after_help = "Examples:\n  ecrou run -it alpine                    a shell in the machine\n  ecrou run ./rootfs.tar.gz -- uname -a   boot a local rootfs archive\n  ecrou run -v $PWD:/workspace ubuntu -- make"
 )]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
     /// Print diagnostic messages
-    #[arg(short, long, global = true)]
+    #[arg(long, global = true)]
     pub verbose: bool,
 }
 
@@ -55,23 +55,32 @@ pub enum Command {
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
-    /// Distribution name or OCI image reference; not needed with
-    /// `--layer`, which boots a provisioned cache entry
+    /// Distribution name, OCI image reference, or a local rootfs
+    /// archive (a path: ./rootfs.tar.gz, /tmp/rootfs.tar); not needed
+    /// with `--layer`, which boots a provisioned cache entry
     #[arg(required_unless_present = "layer")]
     pub image: Option<String>,
+    /// Keep the machine's stdin open: the host's stdin feeds the
+    /// guest, so shells and prompts read typed input
+    #[arg(short = 'i', long)]
+    pub interactive: bool,
+    /// Run the guest console on the terminal (implies --interactive);
+    /// needs a terminal on stdin and stdout
+    #[arg(short = 't', long)]
+    pub tty: bool,
     /// Command to run in the machine; the image's default shell when
     /// omitted. An argument vector after `--` is taken literally; a
     /// single quoted line runs through the image's shell.
     #[arg(last = true)]
     pub command: Vec<String>,
     /// Directory to share into the machine as HOST:GUEST[:ro] (repeatable)
-    #[arg(long = "share")]
-    pub shares: Vec<String>,
+    #[arg(short = 'v', long = "volume")]
+    pub volumes: Vec<String>,
     /// Guest memory size
     #[arg(short = 'm', long, default_value = "1G")]
     pub memory: String,
     /// Guest working directory
-    #[arg(long, default_value = "/")]
+    #[arg(short = 'w', long, default_value = "/")]
     pub workdir: String,
     /// Guest environment KEY=VALUE (repeatable)
     #[arg(short = 'e', long = "env")]
@@ -92,9 +101,9 @@ pub struct RunArgs {
     pub layer: Option<String>,
 }
 
-/// Parse one `HOST:GUEST[:ro]` share specification. The guest path must
-/// be absolute; the host side is checked for existence at run time.
-pub fn parse_share(spec: &str) -> anyhow::Result<ecrou::Share> {
+/// Parse one `HOST:GUEST[:ro]` volume specification. The guest path
+/// must be absolute; the host side is checked for existence at run time.
+pub fn parse_volume(spec: &str) -> anyhow::Result<ecrou::Share> {
     let parts: Vec<&str> = spec.split(':').collect();
     let (host, guest, ro) = match parts.as_slice() {
         [h, g] => (*h, *g, false),
@@ -102,10 +111,10 @@ pub fn parse_share(spec: &str) -> anyhow::Result<ecrou::Share> {
         [_, _, other] => {
             anyhow::bail!("share suffix must be 'ro', got ':{}' in {:?}", other, spec)
         }
-        _ => anyhow::bail!("share must be HOST:GUEST[:ro], got {:?}", spec),
+        _ => anyhow::bail!("volume must be HOST:GUEST[:ro], got {:?}", spec),
     };
     if host.is_empty() || guest.is_empty() {
-        anyhow::bail!("share must be HOST:GUEST[:ro], got {:?}", spec);
+        anyhow::bail!("volume must be HOST:GUEST[:ro], got {:?}", spec);
     }
     if !guest.starts_with('/') {
         anyhow::bail!("share guest path must be absolute, got {:?}", guest);
@@ -133,23 +142,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shares_parse_rw_and_ro() {
-        let s = parse_share("/home/me/work:/workspace").unwrap();
+    fn volumes_parse_rw_and_ro() {
+        let s = parse_volume("/home/me/work:/workspace").unwrap();
         assert_eq!(s.host, std::path::Path::new("/home/me/work"));
         assert_eq!(s.guest, "/workspace");
         assert!(!s.read_only);
 
-        let s = parse_share("/skills:/skills:ro").unwrap();
+        let s = parse_volume("/skills:/skills:ro").unwrap();
         assert!(s.read_only);
     }
 
     #[test]
-    fn shares_reject_malformed_specs() {
-        assert!(parse_share("/only-host").is_err());
-        assert!(parse_share(":/guest").is_err());
-        assert!(parse_share("/host:relative").is_err());
-        assert!(parse_share("/h:/g:rw").is_err());
-        assert!(parse_share("/h:/g:ro:extra").is_err());
+    fn volumes_reject_malformed_specs() {
+        assert!(parse_volume("/only-host").is_err());
+        assert!(parse_volume(":/guest").is_err());
+        assert!(parse_volume("/host:relative").is_err());
+        assert!(parse_volume("/h:/g:rw").is_err());
+        assert!(parse_volume("/h:/g:ro:extra").is_err());
+        let err = format!("{:#}", parse_volume("/only-host").unwrap_err());
+        assert!(err.contains("volume"), "{err}");
+    }
+
+    #[test]
+    fn it_combines_into_interactive_and_tty() {
+        let cli =
+            Cli::try_parse_from(["ecrou", "run", "-it", "alpine", "--", "sh"]).expect("-it parses");
+        let Command::Run(args) = cli.command else {
+            panic!("run expected");
+        };
+        assert!(args.interactive);
+        assert!(args.tty);
+        assert_eq!(args.image.as_deref(), Some("alpine"));
+    }
+
+    #[test]
+    fn v_is_the_volume_short_at_the_run_level() {
+        let cli = Cli::try_parse_from([
+            "ecrou",
+            "run",
+            "-v",
+            "/work:/work:ro",
+            "-v",
+            "/data:/data",
+            "alpine",
+        ])
+        .expect("-v parses");
+        let Command::Run(args) = cli.command else {
+            panic!("run expected");
+        };
+        assert_eq!(args.volumes.len(), 2);
+        assert!(parse_volume(&args.volumes[0]).unwrap().read_only);
+        // Verbose stays reachable by its long form.
+        let cli = Cli::try_parse_from(["ecrou", "--verbose", "probe"]).expect("--verbose parses");
+        assert!(cli.verbose);
+        assert!(
+            Cli::try_parse_from(["ecrou", "-v", "probe"]).is_err(),
+            "-v belongs to run --volume, not the global verbose"
+        );
+    }
+
+    #[test]
+    fn w_aliases_workdir() {
+        let cli = Cli::try_parse_from(["ecrou", "run", "-w", "/src", "alpine"]).expect("-w parses");
+        let Command::Run(args) = cli.command else {
+            panic!("run expected");
+        };
+        assert_eq!(args.workdir, "/src");
     }
 
     #[test]

@@ -199,6 +199,13 @@ pub fn download_image(
                 progress,
             ))?)
         }
+        // A local archive is read in place by the prepare step; there
+        // is nothing to fetch.
+        ImageSource::LocalTarball { path } => Err(anyhow!(
+            "a local rootfs archive is never downloaded: {}",
+            path.display()
+        )
+        .into()),
     }
 }
 

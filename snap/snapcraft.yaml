@@ -6,7 +6,7 @@ description: |
   ecrou boots disposable Linux environments as one-shot microVMs on
   libkrun: it resolves an image reference, boots one VM per command
   with live stdio, propagates the exit code, and throws the machine
-  away. Persistence crosses an explicit `--share` or it does not
+  away. Persistence crosses an explicit `-v/--volume` share or it does not
   happen.
 
   ## Confinement

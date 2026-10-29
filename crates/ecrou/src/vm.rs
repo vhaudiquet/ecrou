@@ -42,6 +42,15 @@ pub struct RunOptions {
     pub workdir: String,
     pub env: Vec<(String, String)>,
     pub hostname: String,
+    /// Keep the machine's stdin open: the host's stdin feeds the guest
+    /// console, so a shell reads typed input and a payload reads a
+    /// pipe. `tty` implies it.
+    pub interactive: bool,
+    /// Run the guest console on the host terminal: raw mode, live
+    /// cursor, the guest sees a tty. Needs a terminal on the host's
+    /// stdin and stdout; without one, run returns an error before any
+    /// machine exists.
+    pub tty: bool,
     /// How much of the engine's own logging reaches stderr
     pub log_level: LogLevel,
     pub no_cache: bool,
@@ -87,6 +96,8 @@ impl Default for RunOptions {
             workdir: "/".to_string(),
             env: Vec::new(),
             hostname: String::new(),
+            interactive: false,
+            tty: false,
             log_level: LogLevel::Normal,
             no_cache: false,
             layer: None,
@@ -129,6 +140,19 @@ pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32
     if options.image.is_empty() {
         return Err(Error::Other(anyhow!("no image given")));
     }
+    // Interactive modes put the console on this process's own stdio;
+    // a tty run additionally demands a real terminal, before any
+    // machine exists to fail halfway into it.
+    let interactive = options.interactive || options.tty;
+    if options.tty {
+        let istty = |fd| unsafe { libc::isatty(fd) } == 1;
+        if !istty(libc::STDIN_FILENO) || !istty(libc::STDOUT_FILENO) {
+            return Err(Error::Other(anyhow!(
+                "a tty run needs a terminal on stdin and stdout"
+            )));
+        }
+    }
+
     krun::kvm_probe()?;
     let krun = Krun::load()?;
 
@@ -171,11 +195,20 @@ pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32
         stdout: guest::CAPTURE_STDOUT.to_string(),
         stderr: guest::CAPTURE_STDERR.to_string(),
     });
+    // A tty machine keeps the payload on the console; an interactive
+    // machine without a terminal has libkrun expose its pipe streams
+    // as virtio ports, which the init wires onto the payload.
+    let stdio = if interactive && !options.tty {
+        guest::GuestStdio::HostPipes
+    } else {
+        guest::GuestStdio::Console
+    };
     let script = guest::init_script(
         &shares,
         &payload,
         &options.workdir,
         &hostname,
+        stdio,
         capture.as_ref(),
     );
     std::fs::write(&init_path, script)
@@ -217,13 +250,19 @@ pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32
             .collect::<Vec<_>>(),
     )?;
 
-    // The console goes through a file we stream to real stdout: without
-    // a tty, libkrun would route guest output through its logger, and
-    // with one, its terminal setup stops a background process with
-    // SIGTTOU. A killed parent kills the machine through PDEATHSIG.
+    // Headless, the console goes through a file we stream to real
+    // stdout: without a tty, libkrun would route guest output through
+    // its logger, and with one, its terminal setup stops a background
+    // process with SIGTTOU. Interactive modes skip the file: with no
+    // console output set, libkrun wires the guest console to this
+    // process's own stdin and stdout (raw mode and its restore are
+    // libkrun's on a tty; pipe streams surface as virtio ports the
+    // init wires). A killed parent kills the machine through PDEATHSIG.
     let console_path = rootfs.dir().join(".ecrou-console");
-    std::fs::File::create(&console_path)
-        .with_context(|| format!("creating {}", console_path.display()))?;
+    if !interactive {
+        std::fs::File::create(&console_path)
+            .with_context(|| format!("creating {}", console_path.display()))?;
+    }
 
     // Fork with no other threads alive: the child only touches libkrun
     // configuration before entering the VM loop, which never returns (a
@@ -247,22 +286,28 @@ pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32
         };
         unsafe {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-            // Unwire the console input: with a tty on fd 0 libkrun puts
-            // that terminal into raw mode, which fights whoever owns it
-            // (and stops a background caller with SIGTTOU). /dev/null
-            // keeps the console on its plain path and still forwards a
-            // Ctrl-C sent to the process group into the guest.
-            let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
-            if null >= 0 {
-                libc::dup2(null, libc::STDIN_FILENO);
-                if null != libc::STDIN_FILENO {
-                    libc::close(null);
+            // Headless only: unwire the console input (with a tty on
+            // fd 0 libkrun puts that terminal into raw mode, which
+            // fights whoever owns it, and stops a background caller
+            // with SIGTTOU). /dev/null keeps the console on its plain
+            // path and still forwards a Ctrl-C sent to the process
+            // group into the guest. An interactive machine wants the
+            // opposite: fd 0 is its console input by design.
+            if !interactive {
+                let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+                if null >= 0 {
+                    libc::dup2(null, libc::STDIN_FILENO);
+                    if null != libc::STDIN_FILENO {
+                        libc::close(null);
+                    }
                 }
+                libc::signal(libc::SIGTTOU, libc::SIG_IGN);
             }
-            libc::signal(libc::SIGTTOU, libc::SIG_IGN);
         }
-        if let Err(err) = krun.set_console_output(ctx, &console_path) {
-            bail(format!("{err:#}"), 125);
+        if !interactive {
+            if let Err(err) = krun.set_console_output(ctx, &console_path) {
+                bail(format!("{err:#}"), 125);
+            }
         }
         if let Err(err) = krun.start_enter(ctx) {
             bail(format!("{err:#}"), 125);
@@ -276,9 +321,56 @@ pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32
         ));
     }
 
-    let reaped = std::sync::atomic::AtomicI32::new(-1);
-    stream_console(&console_path, child, &reaped)?;
-    wait_machine(child, &reaped, &exit_file_host)
+    // The parent holds the terminal's mode across an interactive
+    // machine: libkrun restores through the child's exit observers,
+    // which a SIGKILLed machine never runs. (Only a tty is saved, so a
+    // piped -i run is a no-op here.)
+    let tty_restore = TtyRestore::save(interactive);
+    let result = if interactive {
+        wait_machine(
+            child,
+            &std::sync::atomic::AtomicI32::new(-1),
+            &exit_file_host,
+        )
+    } else {
+        let reaped = std::sync::atomic::AtomicI32::new(-1);
+        stream_console(&console_path, child, &reaped)?;
+        wait_machine(child, &reaped, &exit_file_host)
+    };
+    tty_restore.restore();
+    result
+}
+
+/// The host terminal's mode, saved before a tty machine boots and
+/// restored after it ends.
+struct TtyRestore {
+    saved: Option<libc::termios>,
+}
+
+impl TtyRestore {
+    fn save(wanted: bool) -> Self {
+        let saved = if wanted && unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+            // Safety: tcgetattr on our own stdin; the storage is valid
+            // and the call fills the whole struct or fails.
+            let mut term: libc::termios = unsafe { std::mem::zeroed() };
+            if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut term) } == 0 {
+                Some(term)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        TtyRestore { saved }
+    }
+
+    fn restore(&self) {
+        if let Some(term) = &self.saved {
+            // Safety: the termios value came from tcgetattr on the
+            // same fd; TCSADRAIN flushes output before the switch.
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSADRAIN, term) };
+        }
+    }
 }
 
 /// Relay the console file to real stdout while the machine runs, so
