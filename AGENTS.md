@@ -36,6 +36,8 @@ Rules:
   - `guest` - the guest init script (`crates/ecrou/src/guest.rs`)
   - `rootfs` - cache-aware preparation and persistence
     (`crates/ecrou/src/rootfs.rs`)
+  - `cache` - the rootfs entry store: naming, locking, freshness,
+    layer pointers (`crates/ecrou/src/cache.rs`)
   - `pack` - rootfs tarball packing (`crates/ecrou/src/pack.rs`)
   - `distro` - distro definitions and mirrors (`crates/ecrou/src/distro.rs`)
   - `download` - image download (`crates/ecrou/src/download.rs`)
