@@ -46,6 +46,27 @@ use crate::registry::fetch_oci_digest;
 /// Sidecar suffix marking a cache entry that holds a provisioned rootfs.
 const PROVISIONED_SUFFIX: &str = "provisioned";
 
+/// A layer name is a file name under the cache's `layers/` directory
+/// and a component of entry file names: keep it to a safe charset so a
+/// name like `../x` or `a/b` cannot climb out of the cache directory.
+fn validate_layer_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && !name.starts_with('.');
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Other(anyhow!(
+            "invalid layer name {name:?}: use letters, digits, '_' or '-', \
+             not starting with '.'"
+        )))
+    }
+}
+
 /// Sidecar path for a cache entry: `foo.tar.gz` → `foo.tar.gz.<suffix>`.
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
@@ -104,6 +125,7 @@ impl RootfsCache {
     /// named error, not a download — layers are provisioned, never
     /// fetched.
     pub fn extract_layer(&self, name: &str, progress: &dyn Progress) -> Result<PreparedRootfs> {
+        validate_layer_name(name)?;
         let path = self.layer_entry(name)?.ok_or_else(|| {
             Error::Other(anyhow::anyhow!(
                 "layer {name} is not provisioned: run \
@@ -131,6 +153,7 @@ impl RootfsCache {
     /// `run` should not have to re-derive the key from the spec, only
     /// agree with the provisioning call on what the layer is called.
     pub fn write_layer_pointer(&self, name: &str, cache_filename: &str) -> Result<()> {
+        validate_layer_name(name)?;
         let dir = self.dir.join("layers");
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("Failed to create the layer directory {}", dir.display()))?;
@@ -150,6 +173,7 @@ impl RootfsCache {
     /// names can be gone (a pruned cache, a base bump) while the
     /// pointer survives.
     pub fn layer_entry(&self, name: &str) -> Result<Option<PathBuf>> {
+        validate_layer_name(name)?;
         let pointer = self.dir.join("layers").join(name);
         let filename = match std::fs::read_to_string(&pointer) {
             Ok(filename) => filename,
@@ -275,6 +299,9 @@ impl RootfsCache {
     {
         let arch = req.resolved_arch();
         let source = resolve_source(&req.image, &arch)?;
+        if let Some(key) = &req.layer_key {
+            validate_layer_name(key)?;
+        }
         let cache_path = self.entry_path(&source, &arch, req.layer_key.as_deref());
         let marker = sidecar(&cache_path, PROVISIONED_SUFFIX);
 
@@ -807,6 +834,25 @@ mod tests {
         eprintln!("plain={plain:?} keyed={keyed:?} other={other:?}");
         assert_ne!(plain, keyed, "the key changes the entry");
         assert_ne!(keyed, other, "two keys are two entries");
+    }
+
+    #[test]
+    fn layer_names_cannot_escape_the_cache_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = RootfsCache::new(dir.path().to_path_buf());
+        for bad in ["../evil", "a/b", "", ".", "..", ".hidden", "a\0b"] {
+            assert!(
+                cache.write_layer_pointer(bad, "x.tar.gz").is_err(),
+                "{bad:?} must be rejected"
+            );
+            assert!(cache.layer_entry(bad).is_err(), "{bad:?} must be rejected");
+        }
+        for good in ["base", "dev-tools", "ci_2026", "Layer1"] {
+            assert!(
+                validate_layer_name(good).is_ok(),
+                "{good:?} must be accepted"
+            );
+        }
     }
 
     #[test]
