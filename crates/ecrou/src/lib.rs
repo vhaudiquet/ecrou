@@ -38,6 +38,7 @@ pub mod extract;
 pub mod guest;
 pub mod krun;
 pub mod progress;
+mod registry;
 pub mod rootfs;
 pub mod spec;
 pub mod utils;

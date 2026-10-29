@@ -102,10 +102,7 @@ mod tests {
             b"base: ghcr.io/example/base:v1\npackages:\n  - go\nrun: |\n  cargo install just\n",
         )
         .expect("parses");
-        assert_eq!(
-            full.base.as_deref(),
-            Some("ghcr.io/example/base:v1")
-        );
+        assert_eq!(full.base.as_deref(), Some("ghcr.io/example/base:v1"));
         assert!(full.run.as_deref().unwrap().contains("cargo install"));
 
         assert!(ProvisionSpec::parse(b"\n").is_err(), "empty is an error");

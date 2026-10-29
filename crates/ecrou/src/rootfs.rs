@@ -38,9 +38,10 @@ use tempfile::TempDir;
 use crate::distro::{
     map_arch, parse_image_ref, resolve_distro_url, resolve_distro_version, Distro, ImageSource,
 };
-use crate::download::{digest_sidecar, download_image, fetch_oci_digest};
+use crate::download::{digest_sidecar, download_image};
 use crate::extract::extract_tarball;
 use crate::progress::Progress;
+use crate::registry::fetch_oci_digest;
 
 /// Sidecar suffix marking a cache entry that holds a provisioned rootfs.
 const PROVISIONED_SUFFIX: &str = "provisioned";

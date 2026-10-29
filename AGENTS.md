@@ -38,7 +38,7 @@ Rules:
   - `distro` - distro definitions and mirrors (`crates/ecrou/src/distro.rs`)
   - `download` - image download (`crates/ecrou/src/download.rs`)
   - `extract` - rootfs extraction (`crates/ecrou/src/extract.rs`)
-  - `config` - config file (`crates/ecrou/src/config.rs`)
+  - `registry` - OCI registry client (`crates/ecrou/src/registry.rs`)
   - `utils`, `error`, `progress` - shared helpers
   - `deps` - dependency additions/bumps (manifests, lockfile)
 - Omit the scope entirely for repo-wide changes that do not belong to a
