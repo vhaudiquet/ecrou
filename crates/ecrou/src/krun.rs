@@ -324,11 +324,6 @@ pub fn kvm_probe() -> Result<()> {
     Ok(())
 }
 
-/// True when a KVM probe passes; `ecrou probe` and tests use this.
-pub fn kvm_available() -> bool {
-    kvm_probe().is_ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
