@@ -211,17 +211,25 @@ impl RootfsCache {
     /// The cache path for a prepared entry, keyed or not: a layer key
     /// is spliced into the filename, so a layer and its base — and two
     /// layers of one base — live in separate entries, never overwrite
-    /// each other, and evict separately.
-    pub fn entry_path(&self, source: &ImageSource, arch: &str, layer_key: Option<&str>) -> PathBuf {
+    /// each other, and evict separately. The key is validated here, at
+    /// the splice point, so no caller can derive a path outside the
+    /// cache directory.
+    pub fn entry_path(
+        &self,
+        source: &ImageSource,
+        arch: &str,
+        layer_key: Option<&str>,
+    ) -> Result<PathBuf> {
         match layer_key {
-            None => self.tarball_path(source, arch),
+            None => Ok(self.tarball_path(source, arch)),
             Some(key) => {
+                validate_layer_name(key)?;
                 let filename = generate_cache_filename(source, arch);
                 let stem = filename
                     .rsplit_once('.')
                     .map(|(stem, _)| stem)
                     .unwrap_or(&filename);
-                self.dir.join(format!("{stem}.{key}.tar.gz"))
+                Ok(self.dir.join(format!("{stem}.{key}.tar.gz")))
             }
         }
     }
@@ -251,7 +259,7 @@ impl RootfsCache {
         layer_key: Option<&str>,
     ) -> Result<PathBuf> {
         let source = resolve_source(image, arch)?;
-        Ok(self.entry_path(&source, arch, layer_key))
+        self.entry_path(&source, arch, layer_key)
     }
 
     /// Writes the layer pointer: `layers/<name>` holds the cache
@@ -386,10 +394,7 @@ impl RootfsCache {
     {
         let arch = req.resolved_arch();
         let source = resolve_source(&req.image, &arch)?;
-        if let Some(key) = &req.layer_key {
-            validate_layer_name(key)?;
-        }
-        let cache_path = self.entry_path(&source, &arch, req.layer_key.as_deref());
+        let cache_path = self.entry_path(&source, &arch, req.layer_key.as_deref())?;
         let marker = sidecar(&cache_path, PROVISIONED_SUFFIX);
 
         if !req.no_cache && cache_path.exists() && marker.exists() {
@@ -955,12 +960,24 @@ mod tests {
     fn a_layer_key_splices_into_the_entry_name() {
         let cache = RootfsCache::new(std::path::PathBuf::from("/cache"));
         let source = crate::distro::parse_image_ref("alpine:3.23", "amd64").expect("parses");
-        let plain = cache.entry_path(&source, "amd64", None);
-        let keyed = cache.entry_path(&source, "amd64", Some("abc123"));
-        let other = cache.entry_path(&source, "amd64", Some("def456"));
+        let plain = cache.entry_path(&source, "amd64", None).unwrap();
+        let keyed = cache.entry_path(&source, "amd64", Some("abc123")).unwrap();
+        let other = cache.entry_path(&source, "amd64", Some("def456")).unwrap();
         eprintln!("plain={plain:?} keyed={keyed:?} other={other:?}");
         assert_ne!(plain, keyed, "the key changes the entry");
         assert_ne!(keyed, other, "two keys are two entries");
+    }
+
+    #[test]
+    fn a_path_derivation_never_escapes_the_cache_directory() {
+        // The splice point validates: even a consumer that only
+        // derives paths (never writes) gets the named error instead
+        // of a path outside the cache directory.
+        let cache = RootfsCache::new("/cache");
+        let err = cache
+            .resolved_entry_path("alpine:3.23", "amd64", Some("../x"))
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid layer name"), "{err}");
     }
 
     #[test]
