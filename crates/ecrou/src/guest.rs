@@ -65,7 +65,9 @@ pub fn sh_quote(s: &str) -> String {
 
 /// Render the guest init. The payload runs as a child (never `exec`):
 /// the init must outlive it to write the exit code and power the
-/// machine off.
+/// machine off. A share that fails to mount is named on the console
+/// and ends the init with exit 126: a run without its shares is not
+/// the run that was asked for.
 pub fn init_script(
     shares: &[GuestShare],
     payload: &[String],
@@ -81,11 +83,11 @@ pub fn init_script(
          set -u\n\n\
          mount_share() {\n\
          \x20   tag=\"$1\"; target=\"$2\"; ro=\"$3\"\n\
-         \x20   mkdir -p \"$target\"\n\
+         \x20   mkdir -p \"$target\" || { echo \"ecrou: cannot create share target '$target'\" >&2; exit 126; }\n\
          \x20   if [ \"$ro\" = \"ro\" ]; then\n\
-         \x20       mount -t virtiofs -o ro \"$tag\" \"$target\"\n\
+         \x20       mount -t virtiofs -o ro \"$tag\" \"$target\" || { echo \"ecrou: failed to mount share '$tag' at '$target' (read-only)\" >&2; exit 126; }\n\
          \x20   else\n\
-         \x20       mount -t virtiofs \"$tag\" \"$target\"\n\
+         \x20       mount -t virtiofs \"$tag\" \"$target\" || { echo \"ecrou: failed to mount share '$tag' at '$target'\" >&2; exit 126; }\n\
          \x20   fi\n\
          }\n\n",
     );
@@ -175,6 +177,18 @@ mod tests {
         assert_eq!(sh_quote("it's"), r"'it'\''s'");
         assert_eq!(sh_quote("$HOME `id` && rm"), "'$HOME `id` && rm'");
         assert_eq!(sh_quote("new\nline"), "'new\nline'");
+    }
+
+    #[test]
+    fn a_failed_share_mount_is_diagnosed_and_fatal() {
+        let script = init_script(&[], &["true".into()], "/", "m", GuestStdio::Console, None);
+        assert!(
+            script.contains("failed to mount share '$tag' at '$target'"),
+            "{script}"
+        );
+        assert!(script.contains("cannot create share target"), "{script}");
+        // The diagnosis ends the init: nothing runs without its shares.
+        assert!(script.contains(">&2; exit 126; }"), "{script}");
     }
 
     #[test]
