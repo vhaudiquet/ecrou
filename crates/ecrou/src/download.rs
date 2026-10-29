@@ -113,6 +113,14 @@ pub fn download_image(
             if !url.starts_with("http://") && !url.starts_with("https://") {
                 return Err(anyhow!("Unsupported URL scheme: {}", url).into());
             }
+            if url.ends_with(".tar.bz2") || url.ends_with(".tbz2") {
+                return Err(anyhow!(
+                    "bzip2-compressed tarballs are not supported: {} (use a \
+                     .tar.gz, .tar.xz or .tar.zst source)",
+                    url
+                )
+                .into());
+            }
             // Verify the tarball against the checksum the distro publishes
             // next to it.  A fetch failure (missing artifact, network error)
             // degrades to an unverified download with a warning rather than

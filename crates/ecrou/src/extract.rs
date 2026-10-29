@@ -45,6 +45,14 @@ fn extract_single_archive(
         extract_xz(reader, dest, &mut fixups, progress)?;
     } else if filename.ends_with(".tar.zst") || filename.ends_with(".tar.zstd") {
         extract_zst(reader, dest, &mut fixups, progress)?;
+    } else if filename.ends_with(".tar.bz2") || filename.ends_with(".tbz2") {
+        // Named before the magic-byte fallback misreads a bzip2
+        // stream as an uncompressed tar.
+        return Err(anyhow::anyhow!(
+            "bzip2-compressed tarballs are not supported: {} (use a \
+             .tar.gz, .tar.xz or .tar.zst rootfs)",
+            tarball.display()
+        ));
     } else if filename.ends_with(".tar") {
         extract_tar(reader, dest, &mut fixups, progress)?;
     } else {
@@ -800,6 +808,21 @@ mod tests {
         assert_eq!(
             std::fs::read_link(out.path().join("etc/dir/dangling.0")).unwrap(),
             Path::new("etc/dir/absent.pem")
+        );
+    }
+    #[test]
+    fn a_bzip2_tarball_is_a_named_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let tarball = dir.path().join("rootfs.tar.bz2");
+        std::fs::write(&tarball, b"BZh9-not-really").unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let err = format!(
+            "{:#}",
+            extract_tarball(&tarball, out.path(), &NoProgress).unwrap_err()
+        );
+        assert!(
+            err.contains("bzip2-compressed tarballs are not supported"),
+            "{err}"
         );
     }
 }
