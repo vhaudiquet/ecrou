@@ -88,7 +88,8 @@ impl RootfsCache {
                 // One writer per entry: a concurrent run preparing the
                 // same image waits here instead of downloading a second
                 // copy the atomic rename would throw away.
-                let _entry_lock = EntryLock::acquire(&cache_path).map_err(Error::Other)?;
+                let _entry_lock =
+                    EntryLock::acquire(&cache_path, progress).map_err(Error::Other)?;
                 // Re-derive the freshness answer under the lock: a
                 // competing run may have filled or refreshed the entry
                 // while we waited.

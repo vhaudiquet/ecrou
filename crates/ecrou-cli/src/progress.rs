@@ -88,4 +88,24 @@ impl Progress for TermProgress {
             bar.finish_and_clear();
         }
     }
+
+    fn message(&self, text: &str) {
+        let mut slot = self.bar.lock().unwrap();
+        if slot.is_none() {
+            // No operation is active: the message becomes a spinner
+            // until the next `begin` replaces it.
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{spinner:.green} {msg}")
+                    .unwrap(),
+            );
+            pb.set_message(text.to_string());
+            *slot = Some(pb);
+            return;
+        }
+        if let Some(bar) = &*slot {
+            bar.set_message(text.to_string());
+        }
+    }
 }

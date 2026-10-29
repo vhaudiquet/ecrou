@@ -18,8 +18,9 @@ propagates exit codes. The split is enforced by the dependency edges:
 the library links no clap and no rendering crate. It never writes to
 the terminal: diagnostics go through the `log` facade, filtered by
 `RunOptions::log_level` (an engine-owned enum, not UI booleans), long
-operations report through the `Progress` sink, all output is the
-CLI's. In-process failures come back as typed errors; the one
+operations report through the `Progress` sink (sequential
+`begin`/`advance`/`finish` operations plus uncounted `message`
+status lines), all output is the CLI's. In-process failures come back as typed errors; the one
 exception is the forked machine child's last-gasp diagnostics, which
 land in the console file the parent streams. The CLI owns clap, the
 indicatif rendering of progress events, the log sink, and exit codes.

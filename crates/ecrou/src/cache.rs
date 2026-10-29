@@ -94,9 +94,11 @@ pub(crate) struct EntryLock {
 }
 
 impl EntryLock {
-    /// Block until the entry is free. `no_cache` callers skip the
-    /// lock entirely: an explicit fresh download never waits.
-    pub(crate) fn acquire(entry: &Path) -> anyhow::Result<Self> {
+    /// Block until the entry is free, telling the sink what the run
+    /// is waiting on (a silent block reads as a hang). `no_cache`
+    /// callers skip the lock entirely: an explicit fresh download
+    /// never waits.
+    pub(crate) fn acquire(entry: &Path, progress: &dyn Progress) -> anyhow::Result<Self> {
         use std::os::fd::AsRawFd;
 
         let lock_path = entry.with_extension("lock");
@@ -120,6 +122,10 @@ impl EntryLock {
                 "waiting for another ecrou run to finish preparing {}",
                 entry.display()
             );
+            progress.message(&format!(
+                "Waiting for another ecrou run to finish preparing {}",
+                entry.display()
+            ));
             let held = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
             if held != 0 {
                 return Err(anyhow::Error::from(std::io::Error::last_os_error())
