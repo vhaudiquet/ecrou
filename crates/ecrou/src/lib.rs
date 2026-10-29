@@ -31,7 +31,6 @@
 //! embeds the library exactly the way the CLI does - a [`RootfsCache`]
 //! to prepare a rootfs, then [`run`] to boot it.
 
-pub mod config;
 pub mod distro;
 pub mod download;
 pub mod error;

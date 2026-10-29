@@ -343,8 +343,6 @@ tool.
 └── <...>.provisioned                   # hot-cell marker
 ```
 
-`~/.config/ecrou.yaml` carries over (DNS overrides today).
-
 ## Snap packaging
 
 Confinement: strict. Plugs: `network`, `home`, `kvm`. Manual

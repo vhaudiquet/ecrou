@@ -27,7 +27,6 @@ description: |
   ## Configuration and cache
 
   - image cache: `~/snap/ecrou/common/cache/ecrou`
-  - config: `~/snap/ecrou/common/config/ecrou.yaml`
 
   The home interface does not cover dotfiles, so the XDG
   directories are redirected into the snap's common data area.
@@ -58,17 +57,16 @@ parts:
     build-packages: [cmake, perl]
     override-build: |
       craftctl default
-      # The home interface stops at dotfiles, so ~/.cache and
-      # ~/.config are unreachable under strict confinement. Point the
-      # XDG lookups (the dirs crate honors these variables) into the
-      # snap's durable area, shared across refreshes.
+      # The home interface stops at dotfiles, so ~/.cache is
+      # unreachable under strict confinement. Point the XDG cache
+      # lookup (the dirs crate honors the variable) into the snap's
+      # durable area, shared across refreshes.
       mkdir -p "$CRAFT_PART_INSTALL/command-chain"
       cat > "$CRAFT_PART_INSTALL/command-chain/ecrou-env" <<'EOF'
       #!/bin/sh
       XDG_CACHE_HOME="$SNAP_USER_COMMON/cache"
-      XDG_CONFIG_HOME="$SNAP_USER_COMMON/config"
-      export XDG_CACHE_HOME XDG_CONFIG_HOME
-      mkdir -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME"
+      export XDG_CACHE_HOME
+      mkdir -p "$XDG_CACHE_HOME"
       exec "$@"
       EOF
       chmod 755 "$CRAFT_PART_INSTALL/command-chain/ecrou-env"
