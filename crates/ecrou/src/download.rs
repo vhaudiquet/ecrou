@@ -1,16 +1,31 @@
 //! Download plumbing shared by both image sources: the digest hasher,
-//! distro checksum files, and plain file transfers into the cache.
+//! the shared HTTP client, distro checksum files, and plain file
+//! transfers into the cache.
 
 use crate::progress::{Progress, Unit};
 use anyhow::{anyhow, Context};
-use futures_util::StreamExt;
-use reqwest::Client;
+use reqwest::blocking::Client;
 use sha2::{Digest, Sha256, Sha512};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::distro::{Distro, ImageSource};
 use crate::Result;
+
+/// One HTTP client shape for the crate: a connect window, plus an
+/// optional total request window. Metadata callers (checksum files,
+/// token endpoints, version lookups) pass `Some` — small bodies, so a
+/// total bound is safe. Transfer callers pass `None`: a slow transfer
+/// of any size must finish, and the blocking client offers no per-read
+/// window — a stalled stream is the operator's Ctrl-C.
+pub(crate) fn http_client(request_window: Option<Duration>) -> anyhow::Result<Client> {
+    let mut builder = Client::builder().connect_timeout(Duration::from_secs(30));
+    if let Some(window) = request_window {
+        builder = builder.timeout(window);
+    }
+    builder.build().context("Failed to create HTTP client")
+}
 
 /// Path of the digest sidecar file for a cached OCI image.
 /// e.g. `foo.tar.gz` → `foo.tar.gz.digest`
@@ -91,11 +106,6 @@ pub fn download_image(
     arch: &str,
     progress: &dyn Progress,
 ) -> Result<()> {
-    // Create a single Tokio runtime for all async I/O in this download.
-    // Previously each of the two sync wrappers (download_file_sync and
-    // download_oci_image) created their own runtime; this consolidates them.
-    let rt = tokio::runtime::Runtime::new().context("Failed to create Tokio runtime")?;
-
     match source {
         ImageSource::DirectTarball { distro, version } => {
             let url = crate::distro::resolve_distro_url(distro, version.as_deref(), arch)?;
@@ -107,7 +117,7 @@ pub fn download_image(
             // next to it.  A fetch failure (missing artifact, network error)
             // degrades to an unverified download with a warning rather than
             // hard-failing, mirroring the digest freshness check in rootfs.
-            let expected = match rt.block_on(fetch_published_checksum(distro, &url)) {
+            let expected = match fetch_published_checksum(distro, &url) {
                 Ok(expected) => Some(expected),
                 Err(e) => {
                     log::warn!(
@@ -118,12 +128,8 @@ pub fn download_image(
                     None
                 }
             };
-            Ok(rt.block_on(download_file_async(
-                &url,
-                dest,
-                progress,
-                expected.as_deref(),
-            ))?)
+            download_file(&url, dest, progress, expected.as_deref())?;
+            Ok(())
         }
         ImageSource::OciImage {
             registry,
@@ -132,14 +138,15 @@ pub fn download_image(
             architecture,
         } => {
             log::debug!("Pulling OCI image: {}/{}:{}", registry, repository, tag);
-            Ok(rt.block_on(crate::registry::download_oci_image_async(
+            crate::registry::download_oci_image(
                 registry,
                 repository,
                 tag,
                 architecture,
                 dest,
                 progress,
-            ))?)
+            )?;
+            Ok(())
         }
         // A local archive is read in place by the prepare step; there
         // is nothing to fetch.
@@ -152,22 +159,15 @@ pub fn download_image(
 }
 
 /// Fetch the sha256 the distro publishes for the tarball at `tarball_url`.
-async fn fetch_published_checksum(distro: &Distro, tarball_url: &str) -> anyhow::Result<String> {
+fn fetch_published_checksum(distro: &Distro, tarball_url: &str) -> anyhow::Result<String> {
     let Some(checksum_url) = crate::distro::checksum_artifact_url(distro, tarball_url) else {
         return Err(anyhow!("no checksum artifact for {}", tarball_url));
     };
 
-    // Metadata call: a small body, so the read window alone bounds it.
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        .read_timeout(Duration::from_secs(30))
-        .build()
-        .context("Failed to create HTTP client")?;
-
+    let client = http_client(Some(Duration::from_secs(30)))?;
     let response = client
         .get(&checksum_url)
         .send()
-        .await
         .with_context(|| format!("Failed to fetch checksum artifact {}", checksum_url))?;
 
     if !response.status().is_success() {
@@ -178,7 +178,7 @@ async fn fetch_published_checksum(distro: &Distro, tarball_url: &str) -> anyhow:
         ));
     }
 
-    let text = response.text().await?;
+    let text = response.text()?;
     let filename = tarball_url.rsplit('/').next().unwrap_or("");
     expected_digest_from_checksums(&text, filename).ok_or_else(|| {
         anyhow!(
@@ -204,7 +204,7 @@ fn expected_digest_from_checksums(text: &str, filename: &str) -> Option<String> 
     None
 }
 
-async fn download_file_async(
+fn download_file(
     url: &str,
     dest: &Path,
     progress: &dyn Progress,
@@ -212,20 +212,8 @@ async fn download_file_async(
 ) -> anyhow::Result<()> {
     log::debug!("Downloading: {}", url);
 
-    // No total timeout: a slow transfer of any size must finish. The
-    // connect window and the per-read window catch dead peers and
-    // stalled streams instead.
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        .read_timeout(Duration::from_secs(60))
-        .build()
-        .context("Failed to create HTTP client")?;
-
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .context("Failed to start download")?;
+    let client = http_client(None)?;
+    let mut response = client.get(url).send().context("Failed to start download")?;
 
     if !response.status().is_success() {
         return Err(anyhow!("Download failed: HTTP {}", response.status()));
@@ -235,9 +223,7 @@ async fn download_file_async(
 
     // Create parent directories
     if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .context("Failed to create cache directory")?;
+        std::fs::create_dir_all(parent).context("Failed to create cache directory")?;
     }
 
     progress.begin(
@@ -256,17 +242,19 @@ async fn download_file_async(
     // reaches the cache; on any failure after the temp file is created we
     // remove it so stale partial files don't accumulate.
     let mut hasher = DownloadHasher::new();
-    let result: anyhow::Result<()> = async {
-        let mut file = tokio::fs::File::create(&temp_dest)
-            .await
-            .context("Failed to create temporary file")?;
+    let result: anyhow::Result<()> = (|| {
+        let mut file =
+            std::fs::File::create(&temp_dest).context("Failed to create temporary file")?;
 
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("Download interrupted")?;
-            tokio::io::copy(&mut &chunk[..], &mut file).await?;
-            hasher.update(&chunk);
-            progress.advance(chunk.len() as u64);
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = response.read(&mut buf).context("Download interrupted")?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n]).context("Failed to write chunk")?;
+            hasher.update(&buf[..n]);
+            progress.advance(n as u64);
         }
 
         progress.finish();
@@ -275,18 +263,16 @@ async fn download_file_async(
             log::debug!("Verified content digest: {}", dest.display());
         }
 
-        tokio::fs::rename(&temp_dest, dest)
-            .await
+        std::fs::rename(&temp_dest, dest)
             .context("Failed to move partial download to final destination")?;
         log::debug!("Download complete: {}", dest.display());
 
         Ok(())
-    }
-    .await;
+    })();
 
     if result.is_err() {
         // Best-effort cleanup; ignore errors (file may not exist if creation failed).
-        let _ = tokio::fs::remove_file(&temp_dest).await;
+        let _ = std::fs::remove_file(&temp_dest);
     }
 
     result

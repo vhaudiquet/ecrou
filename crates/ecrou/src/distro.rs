@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 
@@ -198,7 +199,10 @@ pub fn checksum_artifact_url(distro: &Distro, tarball_url: &str) -> Option<Strin
 /// Fetch the latest Ubuntu codename from a changelogs.ubuntu.com meta-release file.
 /// Pass the LTS-only URL to get the latest LTS, or the full URL for the latest release.
 fn fetch_ubuntu_codename(meta_release_url: &str) -> anyhow::Result<String> {
-    let text = reqwest::blocking::get(meta_release_url)
+    let client = crate::download::http_client(Some(Duration::from_secs(30)))?;
+    let text = client
+        .get(meta_release_url)
+        .send()
         .with_context(|| format!("Failed to fetch {}", meta_release_url))?
         .text()
         .with_context(|| format!("Failed to read {}", meta_release_url))?;
@@ -240,7 +244,10 @@ fn fetch_alpine_version_from_branch(branch: &str, arch: &str) -> anyhow::Result<
         "https://dl-cdn.alpinelinux.org/alpine/{}/releases/{}/latest-releases.yaml",
         branch, arch
     );
-    let text = reqwest::blocking::get(&url)
+    let client = crate::download::http_client(Some(Duration::from_secs(30)))?;
+    let text = client
+        .get(&url)
+        .send()
         .with_context(|| {
             format!(
                 "Failed to fetch Alpine latest-releases.yaml for branch {}",
@@ -305,7 +312,10 @@ pub fn resolve_distro_version(
 /// meta-release file (e.g. "24.04" → "noble", "22.04" → "jammy").
 /// Uses the full meta-release (not -lts) so non-LTS versions are also covered.
 fn fetch_ubuntu_version_map() -> anyhow::Result<std::collections::HashMap<String, String>> {
-    let text = reqwest::blocking::get("https://changelogs.ubuntu.com/meta-release")
+    let client = crate::download::http_client(Some(Duration::from_secs(30)))?;
+    let text = client
+        .get("https://changelogs.ubuntu.com/meta-release")
+        .send()
         .context("Failed to fetch Ubuntu meta-release")?
         .text()
         .context("Failed to read Ubuntu meta-release")?;

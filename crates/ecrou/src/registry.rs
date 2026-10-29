@@ -3,12 +3,13 @@
 //! and content-addressed layer blobs bundled into a cache entry.
 
 use anyhow::{anyhow, Context};
-use futures_util::StreamExt;
-use reqwest::Client;
+use reqwest::blocking::Client;
 use serde_json::Value;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
+use crate::download::http_client;
 use crate::download::{digest_sidecar, DownloadHasher};
 use crate::progress::{Progress, Unit};
 use crate::{Error, Result};
@@ -17,25 +18,13 @@ use crate::{Error, Result};
 /// layers.  The registry returns the content-addressable digest in the
 /// `Docker-Content-Digest` response header of any manifest GET.
 pub(crate) fn fetch_oci_digest(registry: &str, repository: &str, tag: &str) -> Result<String> {
-    let digest = tokio::runtime::Runtime::new()
-        .context("Failed to create Tokio runtime")?
-        .block_on(fetch_oci_digest_async(registry, repository, tag))?;
-    Ok(digest)
+    fetch_oci_digest_inner(registry, repository, tag).map_err(Error::Other)
 }
 
-async fn fetch_oci_digest_async(
-    registry: &str,
-    repository: &str,
-    tag: &str,
-) -> anyhow::Result<String> {
-    // Metadata call: a small body, so the read window alone bounds it.
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        .read_timeout(Duration::from_secs(30))
-        .build()
-        .context("Failed to create HTTP client")?;
-
-    let token = get_auth_token(&client, registry, repository).await?;
+fn fetch_oci_digest_inner(registry: &str, repository: &str, tag: &str) -> anyhow::Result<String> {
+    // Metadata: a small body, so a total request bound is safe.
+    let client = http_client(Some(Duration::from_secs(30)))?;
+    let token = get_auth_token(&client, registry, repository)?;
 
     let manifest_url = if registry == "docker.io" {
         format!(
@@ -57,7 +46,6 @@ async fn fetch_oci_digest_async(
         )
         .header("Authorization", format!("Bearer {}", token))
         .send()
-        .await
         .context("Failed to fetch manifest for digest check")?;
 
     if !response.status().is_success() {
@@ -75,7 +63,7 @@ async fn fetch_oci_digest_async(
         .ok_or_else(|| anyhow!("Registry did not return a Docker-Content-Digest header"))
 }
 
-pub(crate) async fn download_oci_image_async(
+pub(crate) fn download_oci_image(
     registry: &str,
     repository: &str,
     tag: &str,
@@ -83,17 +71,8 @@ pub(crate) async fn download_oci_image_async(
     dest: &Path,
     progress: &dyn Progress,
 ) -> anyhow::Result<()> {
-    // No total timeout: a slow transfer of any size must finish. The
-    // connect window and the per-read window catch dead peers and
-    // stalled streams instead.
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        .read_timeout(Duration::from_secs(60))
-        .build()
-        .context("Failed to create HTTP client")?;
-
-    let digest =
-        try_download_oci_image(&client, registry, repository, tag, arch, dest, progress).await?;
+    let client = http_client(None)?;
+    let digest = try_download_oci_image(&client, registry, repository, tag, arch, dest, progress)?;
 
     // Persist the manifest digest so the next run can skip the download when
     // the tag hasn't changed (see fetch_oci_digest / digest_sidecar).
@@ -104,7 +83,7 @@ pub(crate) async fn download_oci_image_async(
     Ok(())
 }
 
-async fn try_download_oci_image(
+fn try_download_oci_image(
     client: &Client,
     registry: &str,
     repository: &str,
@@ -114,7 +93,7 @@ async fn try_download_oci_image(
     progress: &dyn Progress,
 ) -> anyhow::Result<String> {
     // Get authentication token for the registry
-    let token = get_auth_token(client, registry, repository).await?;
+    let token = get_auth_token(client, registry, repository)?;
 
     // Construct manifest URL based on registry
     let manifest_url = if registry == "docker.io" {
@@ -135,7 +114,6 @@ async fn try_download_oci_image(
         .header("Accept", "application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json")
         .header("Authorization", format!("Bearer {}", token))
         .send()
-        .await
         .context("Failed to get image manifest")?;
 
     if !response.status().is_success() {
@@ -156,7 +134,7 @@ async fn try_download_oci_image(
         .map(|s| s.to_string())
         .unwrap_or_default();
 
-    let body = response.text().await?;
+    let body = response.text()?;
     let manifest: Value = serde_json::from_str(&body).context("Failed to parse manifest JSON")?;
 
     // Check if this is a manifest list (multi-arch)
@@ -208,7 +186,6 @@ async fn try_download_oci_image(
             .header("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json")
             .header("Authorization", format!("Bearer {}", token))
             .send()
-            .await
             .context("Failed to get architecture manifest")?;
 
         if !arch_response.status().is_success() {
@@ -218,7 +195,7 @@ async fn try_download_oci_image(
             ));
         }
 
-        let arch_body = arch_response.text().await?;
+        let arch_body = arch_response.text()?;
 
         // The arch manifest was requested by digest: verify the response
         // matches, since the layer digests read from it are trusted next.
@@ -293,8 +270,7 @@ async fn try_download_oci_image(
             &label,
             layer_digest,
             progress,
-        )
-        .await?;
+        )?;
         layer_names.push(layer_name);
     }
 
@@ -348,11 +324,7 @@ async fn try_download_oci_image(
     Ok(tag_digest)
 }
 
-async fn get_auth_token(
-    client: &Client,
-    registry: &str,
-    repository: &str,
-) -> anyhow::Result<String> {
+fn get_auth_token(client: &Client, registry: &str, repository: &str) -> anyhow::Result<String> {
     // Docker Hub has a well-known, stable auth endpoint.
     if registry == "docker.io" {
         let url = format!(
@@ -360,7 +332,7 @@ async fn get_auth_token(
             repository
         );
         log::debug!("Getting auth token from: {}", url);
-        return fetch_bearer_token(client, &url).await;
+        return fetch_bearer_token(client, &url);
     }
 
     // For every other registry follow the OCI Distribution Spec §4.2:
@@ -371,7 +343,6 @@ async fn get_auth_token(
     let probe = client
         .get(&probe_url)
         .send()
-        .await
         .with_context(|| format!("Failed to probe registry at {}", probe_url))?;
 
     match probe.status().as_u16() {
@@ -412,7 +383,7 @@ async fn get_auth_token(
         realm, service, repository
     );
     log::debug!("Getting auth token from: {}", token_url);
-    fetch_bearer_token(client, &token_url).await
+    fetch_bearer_token(client, &token_url)
 }
 
 /// Parse a `Bearer realm="...",service="..."[,scope="..."]` header value.
@@ -452,11 +423,10 @@ fn parse_www_authenticate(header: &str) -> Option<(String, String)> {
 }
 
 /// Fetch a bearer token from a fully-constructed token URL.
-async fn fetch_bearer_token(client: &Client, token_url: &str) -> anyhow::Result<String> {
+fn fetch_bearer_token(client: &Client, token_url: &str) -> anyhow::Result<String> {
     let response = client
         .get(token_url)
         .send()
-        .await
         .context("Failed to request auth token")?;
 
     if !response.status().is_success() {
@@ -464,7 +434,7 @@ async fn fetch_bearer_token(client: &Client, token_url: &str) -> anyhow::Result<
         return Ok(String::new());
     }
 
-    let body = response.text().await?;
+    let body = response.text()?;
     let json: Value = serde_json::from_str(&body).context("Failed to parse auth token response")?;
 
     // OCI spec uses "token"; Docker also emits "access_token".
@@ -475,7 +445,7 @@ async fn fetch_bearer_token(client: &Client, token_url: &str) -> anyhow::Result<
         .ok_or_else(|| anyhow!("No token field in auth response: {}", body))
 }
 
-async fn download_blob_with_auth(
+fn download_blob_with_auth(
     client: &Client,
     url: &str,
     dest: &Path,
@@ -489,7 +459,7 @@ async fn download_blob_with_auth(
         request = request.header("Authorization", format!("Bearer {}", token));
     }
 
-    let response = request.send().await.context("Failed to start download")?;
+    let mut response = request.send().context("Failed to start download")?;
 
     if !response.status().is_success() {
         return Err(anyhow!(
@@ -502,24 +472,21 @@ async fn download_blob_with_auth(
 
     progress.begin(label, Unit::Bytes, (total_size > 0).then_some(total_size));
 
-    let mut file = tokio::fs::File::create(dest)
-        .await
-        .context("Failed to create destination file")?;
+    let mut file = std::fs::File::create(dest).context("Failed to create destination file")?;
 
     let mut hasher = DownloadHasher::new();
-    let mut stream = response.bytes_stream();
-    use tokio::io::AsyncWriteExt;
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("Failed to read chunk")?;
-        file.write_all(&chunk)
-            .await
-            .context("Failed to write chunk")?;
-        hasher.update(&chunk);
-        progress.advance(chunk.len() as u64);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = response.read(&mut buf).context("Failed to read chunk")?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n]).context("Failed to write chunk")?;
+        hasher.update(&buf[..n]);
+        progress.advance(n as u64);
     }
 
-    file.flush().await?;
+    file.flush().context("Failed to flush the layer file")?;
     progress.finish();
 
     // The blob was addressed by this digest in the manifest; a mismatch means
