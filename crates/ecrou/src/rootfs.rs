@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
 
+use crate::error::Error;
 use crate::Result;
 use tempfile::TempDir;
 
@@ -77,6 +78,87 @@ impl RootfsCache {
     /// Cache entry (tarball path) for an image source and architecture.
     pub fn tarball_path(&self, source: &ImageSource, arch: &str) -> PathBuf {
         self.dir.join(generate_cache_filename(source, arch))
+    }
+
+    /// The cache path for a prepared entry, keyed or not: a layer key
+    /// is spliced into the filename, so a layer and its base — and two
+    /// layers of one base — live in separate entries, never overwrite
+    /// each other, and evict separately.
+    pub fn entry_path(&self, source: &ImageSource, arch: &str, layer_key: Option<&str>) -> PathBuf {
+        match layer_key {
+            None => self.tarball_path(source, arch),
+            Some(key) => {
+                let filename = generate_cache_filename(source, arch);
+                let stem = filename
+                    .rsplit_once('.')
+                    .map(|(stem, _)| stem)
+                    .unwrap_or(&filename);
+                self.dir.join(format!("{stem}.{key}.tar.gz"))
+            }
+        }
+    }
+
+    /// Extracts a named layer into a fresh scratch directory: the boot
+    /// side of `run --layer`. A missing pointer or a pruned entry is a
+    /// named error, not a download — layers are provisioned, never
+    /// fetched.
+    pub fn extract_layer(&self, name: &str, progress: &dyn Progress) -> Result<PreparedRootfs> {
+        let path = self.layer_entry(name)?.ok_or_else(|| {
+            Error::Other(anyhow::anyhow!(
+                "layer {name} is not provisioned: run \
+                     `ecrou provision --spec <spec> --layer {name}` first"
+            ))
+        })?;
+        let arch = std::env::consts::ARCH
+            .replace("x86_64", "amd64")
+            .replace("aarch64", "arm64");
+        extract_prepared(path, arch, progress).map_err(Error::Other)
+    }
+
+    /// The cache path an image resolves to, keyed or not — the same
+    /// resolution `prepare` does (floating aliases resolved), so a
+    /// pointer written from this path names an entry that exists.
+    pub fn resolved_entry_path(
+        &self,
+        image: &str,
+        arch: &str,
+        layer_key: Option<&str>,
+    ) -> Result<PathBuf> {
+        let source = resolve_source(image, arch)?;
+        Ok(self.entry_path(&source, arch, layer_key))
+    }
+
+    /// Writes the layer pointer: `layers/<name>` holds the cache
+    /// filename the name resolves to. Consumers boot layers by name —
+    /// `run` should not have to re-derive the key from the spec, only
+    /// agree with the provisioning call on what the layer is called.
+    pub fn write_layer_pointer(&self, name: &str, cache_filename: &str) -> Result<()> {
+        let dir = self.dir.join("layers");
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("Failed to create the layer directory {}", dir.display()))?;
+        std::fs::write(dir.join(name), cache_filename)
+            .with_context(|| format!("Failed to write the layer pointer for {name}"))?;
+        Ok(())
+    }
+
+    /// The cache path a layer pointer names, and whether the layer is
+    /// really there: a pointer is a name, not a promise — the entry it
+    /// names can be gone (a pruned cache, a base bump) while the
+    /// pointer survives.
+    pub fn layer_entry(&self, name: &str) -> Result<Option<PathBuf>> {
+        let pointer = self.dir.join("layers").join(name);
+        let filename = match std::fs::read_to_string(&pointer) {
+            Ok(filename) => filename,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(Error::Other(
+                    anyhow::Error::from(err)
+                        .context(format!("reading the layer pointer for {name}")),
+                ))
+            }
+        };
+        let path = self.dir.join(filename.trim());
+        Ok((path.exists() && sidecar(&path, PROVISIONED_SUFFIX).exists()).then_some(path))
     }
 
     /// Resolve `req`, download through the cache when needed, and extract
@@ -172,7 +254,7 @@ impl RootfsCache {
     {
         let arch = req.resolved_arch();
         let source = resolve_source(&req.image, &arch)?;
-        let cache_path = self.tarball_path(&source, &arch);
+        let cache_path = self.entry_path(&source, &arch, req.layer_key.as_deref());
         let marker = sidecar(&cache_path, PROVISIONED_SUFFIX);
 
         if !req.no_cache && cache_path.exists() && marker.exists() {
@@ -180,14 +262,32 @@ impl RootfsCache {
             return Ok(extract_prepared(cache_path, arch, progress)?);
         }
 
-        let rootfs = self.prepare(req, progress)?;
+        // The miss path prepares the PRISTINE base — a keyed entry
+        // has no tarball of its own to prepare from, and the base
+        // must download if missing. The key is this call's business,
+        // never prepare's.
+        let mut base_req = req.clone();
+        base_req.layer_key = None;
+        let rootfs = self.prepare(&base_req, progress)?;
         provision(&rootfs)?;
-        rootfs.persist().with_context(|| {
-            format!(
-                "Failed to persist provisioned rootfs to {}",
-                cache_path.display()
-            )
-        })?;
+        if req.layer_key.is_some() {
+            // The prepared scratch is the BASE (a keyed entry has no
+            // tarball to prepare from): the provisioned tree lands in
+            // the keyed entry, not over the base.
+            rootfs.persist_to(&cache_path).with_context(|| {
+                format!(
+                    "Failed to persist provisioned layer to {}",
+                    cache_path.display()
+                )
+            })?;
+        } else {
+            rootfs.persist().with_context(|| {
+                format!(
+                    "Failed to persist provisioned rootfs to {}",
+                    cache_path.display()
+                )
+            })?;
+        }
         Ok(rootfs)
     }
 }
@@ -206,6 +306,12 @@ pub struct PrepareRequest {
 
     /// Ignore the cache and download a fresh image.
     pub no_cache: bool,
+
+    /// A layer key: when set, the cache entry is the keyed layer over
+    /// the image rather than the image itself — the entry is never
+    /// downloaded, only provisioned into existence
+    /// ([`RootfsCache::prepare_provisioned`]).
+    pub layer_key: Option<String>,
 }
 
 impl PrepareRequest {
@@ -214,6 +320,7 @@ impl PrepareRequest {
             image: image.into(),
             arch: String::new(),
             no_cache: false,
+            layer_key: None,
         }
     }
 
@@ -261,14 +368,21 @@ impl PreparedRootfs {
     /// (indistinguishable from a pristine hit) — only
     /// [`RootfsCache::prepare_provisioned`] interprets the marker.
     pub fn persist(&self) -> Result<()> {
-        pack_rootfs(self.dir(), &self.cache_path)?;
-        std::fs::write(sidecar(&self.cache_path, PROVISIONED_SUFFIX), b"").with_context(|| {
+        self.persist_to(&self.cache_path)
+    }
+
+    /// Packs the tree into an arbitrary cache entry — how a provisioned
+    /// layer lands under its own key while the prepared scratch still
+    /// carries the base's own cache path.
+    pub fn persist_to(&self, cache_path: &Path) -> Result<()> {
+        pack_rootfs(self.dir(), cache_path)?;
+        std::fs::write(sidecar(cache_path, PROVISIONED_SUFFIX), b"").with_context(|| {
             format!(
                 "Failed to write provisioned marker for {}",
-                self.cache_path.display()
+                cache_path.display()
             )
         })?;
-        log::debug!("Persisted rootfs to cache: {}", self.cache_path.display());
+        log::debug!("Persisted rootfs to cache: {}", cache_path.display());
         Ok(())
     }
 }
@@ -692,5 +806,49 @@ mod tests {
         assert!(pack_rootfs(Path::new("/nonexistent-rootfs"), &dest).is_err());
         assert!(!dest.exists());
         assert!(!dest.with_extension("partial").exists());
+    }
+
+    #[test]
+    fn a_layer_key_splices_into_the_entry_name() {
+        let cache = RootfsCache::new(std::path::PathBuf::from("/cache"));
+        let source = crate::distro::parse_image_ref("alpine:3.23", "amd64").expect("parses");
+        let plain = cache.entry_path(&source, "amd64", None);
+        let keyed = cache.entry_path(&source, "amd64", Some("abc123"));
+        let other = cache.entry_path(&source, "amd64", Some("def456"));
+        eprintln!("plain={plain:?} keyed={keyed:?} other={other:?}");
+        assert_ne!(plain, keyed, "the key changes the entry");
+        assert_ne!(keyed, other, "two keys are two entries");
+    }
+
+    #[test]
+    fn a_layer_pointer_resolves_only_while_the_entry_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = RootfsCache::new(dir.path().to_path_buf());
+        assert!(
+            cache.layer_entry("nope").expect("reads").is_none(),
+            "no pointer, no entry"
+        );
+        cache
+            .write_layer_pointer("w", "alpine-3.23.7-x86_64.tar.abc.tar.gz")
+            .expect("writes");
+        assert!(
+            cache.layer_entry("w").expect("reads").is_none(),
+            "a pointer without its entry resolves to nothing"
+        );
+        std::fs::write(
+            dir.path().join("alpine-3.23.7-x86_64.tar.abc.tar.gz"),
+            b"tarball",
+        )
+        .expect("the entry appears");
+        std::fs::write(
+            dir.path()
+                .join("alpine-3.23.7-x86_64.tar.abc.tar.gz.provisioned"),
+            b"",
+        )
+        .expect("the marker appears");
+        assert!(
+            cache.layer_entry("w").expect("reads").is_some(),
+            "pointer + entry + marker resolve"
+        );
     }
 }

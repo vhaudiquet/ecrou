@@ -27,9 +27,20 @@ pub enum Command {
     /// command installed. Cached entries are reused as-is; --no-cache
     /// re-downloads and re-provisions.
     Provision {
-        /// Distribution name or OCI image reference
-        image: String,
-        /// Ignore the cache and download a fresh image
+        /// Distribution name or OCI image reference; the spec's `base`
+        /// when omitted and the spec carries one
+        image: Option<String>,
+        /// A provisioning spec file (YAML: base, packages, run) — the
+        /// layer it describes is keyed by the file's content, so the
+        /// same spec never provisions twice and a changed spec never
+        /// reuses an old layer
+        #[arg(long)]
+        spec: Option<std::path::PathBuf>,
+        /// Name the provisioned layer, so runs can boot it by name
+        /// (`run --layer NAME`) without re-deriving anything
+        #[arg(long)]
+        layer: Option<String>,
+        /// Ignore the cache: re-download the base and re-provision
         #[arg(long)]
         no_cache: bool,
         /// The provisioning command. An argument vector after `--` is
@@ -44,8 +55,10 @@ pub enum Command {
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
-    /// Distribution name or OCI image reference
-    pub image: String,
+    /// Distribution name or OCI image reference; not needed with
+    /// `--layer`, which boots a provisioned cache entry
+    #[arg(required_unless_present = "layer")]
+    pub image: Option<String>,
     /// Command to run in the machine; the image's default shell when
     /// omitted. An argument vector after `--` is taken literally; a
     /// single quoted line runs through the image's shell.
@@ -73,6 +86,10 @@ pub struct RunArgs {
     /// Ignore the cache and download a fresh image
     #[arg(long)]
     pub no_cache: bool,
+    /// Boot a named provisioned layer (see `provision --layer`)
+    /// instead of resolving an image
+    #[arg(long)]
+    pub layer: Option<String>,
 }
 
 /// Parse one `HOST:GUEST[:ro]` share specification. The guest path must

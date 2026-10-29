@@ -40,6 +40,7 @@ pub mod guest;
 pub mod krun;
 pub mod progress;
 pub mod rootfs;
+pub mod spec;
 pub mod utils;
 pub mod vm;
 

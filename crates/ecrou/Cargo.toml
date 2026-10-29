@@ -15,6 +15,7 @@ serde_yaml = "0.9"
 # HTTP downloads
 reqwest = { version = "0.13", features = ["blocking", "stream"] }
 
+
 # Tarball extraction
 tar = "0.4"
 flate2 = "1"

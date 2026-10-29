@@ -45,6 +45,11 @@ pub struct RunOptions {
     /// How much of the engine's own logging reaches stderr
     pub log_level: LogLevel,
     pub no_cache: bool,
+    /// When set, boot the named provisioned layer from the cache
+    /// instead of resolving an image: no download, no resolution —
+    /// the layer is whatever `ecrou provision --spec … --layer …`
+    /// persisted under that name.
+    pub layer: Option<String>,
     /// When set, the payload's stdout and stderr are captured into
     /// files in this host directory (`stdout` and `stderr` under it):
     /// the run adds the directory as an internal read-write share,
@@ -84,6 +89,7 @@ impl Default for RunOptions {
             hostname: String::new(),
             log_level: LogLevel::Normal,
             no_cache: false,
+            layer: None,
             capture: None,
         }
     }
@@ -91,6 +97,20 @@ impl Default for RunOptions {
 
 /// Run one machine to completion and return the payload's exit code.
 pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32> {
+    // A named layer boots straight from its cache entry: no image
+    // resolution, no download — the layer is whatever the provision
+    // call persisted under that name.
+    if let Some(name) = &options.layer {
+        let cache = RootfsCache::new(RootfsCache::default_dir()?);
+        let rootfs = cache.extract_layer(name, progress)?;
+        // Downstream naming (the hostname, diagnostics) rides the
+        // layer name: the entry is what booted, not an image.
+        let options = RunOptions {
+            image: name.clone(),
+            ..options.clone()
+        };
+        return run_prepared(&rootfs, &options);
+    }
     let mut request = PrepareRequest::new(options.image.clone());
     request.arch = options.arch.clone();
     request.no_cache = options.no_cache;
@@ -109,7 +129,6 @@ pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32
     if options.image.is_empty() {
         return Err(Error::Other(anyhow!("no image given")));
     }
-
     krun::kvm_probe()?;
     let krun = Krun::load()?;
 
