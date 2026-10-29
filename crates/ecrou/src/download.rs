@@ -268,8 +268,12 @@ async fn download_file_async(
 ) -> anyhow::Result<()> {
     log::debug!("Downloading: {}", url);
 
+    // No total timeout: a slow transfer of any size must finish. The
+    // connect window and the per-read window catch dead peers and
+    // stalled streams instead.
     let client = Client::builder()
-        .timeout(Duration::from_secs(300))
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(60))
         .build()
         .context("Failed to create HTTP client")?;
 
@@ -349,8 +353,12 @@ async fn download_oci_image_async(
     dest: &Path,
     progress: &dyn Progress,
 ) -> anyhow::Result<()> {
+    // No total timeout: a slow transfer of any size must finish. The
+    // connect window and the per-read window catch dead peers and
+    // stalled streams instead.
     let client = Client::builder()
-        .timeout(Duration::from_secs(300))
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(60))
         .build()
         .context("Failed to create HTTP client")?;
 
