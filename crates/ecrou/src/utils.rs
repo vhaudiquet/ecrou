@@ -1,6 +1,3 @@
-use anyhow::anyhow;
-
-use crate::Result;
 use std::path::{Path, PathBuf};
 
 // ============================================================================
@@ -131,45 +128,6 @@ impl Arch {
             Arch::Unknown => "unknown",
         }
     }
-
-    /// Get the QEMU binary suffix (e.g., "qemu-system-x86_64")
-    pub fn qemu_system_name(&self) -> &'static str {
-        match self {
-            Arch::Amd64 => "x86_64",
-            Arch::Arm64 => "aarch64",
-            Arch::Armhf => "arm",
-            Arch::Riscv64 => "riscv64",
-            Arch::Ppc64el => "ppc64",
-            Arch::S390x => "s390x",
-            Arch::Unknown => "unknown",
-        }
-    }
-
-    /// Get the QEMU binfmt_misc name
-    pub fn qemu_binfmt_name(&self) -> &'static str {
-        match self {
-            Arch::Amd64 => "x86_64",
-            Arch::Arm64 => "aarch64",
-            Arch::Armhf => "arm",
-            Arch::Riscv64 => "riscv64",
-            Arch::Ppc64el => "ppc64le",
-            Arch::S390x => "s390x",
-            Arch::Unknown => "unknown",
-        }
-    }
-
-    /// Get the package suffix for QEMU system emulator
-    pub fn qemu_package_suffix(&self) -> &'static str {
-        match self {
-            Arch::Amd64 => "x86",
-            Arch::Arm64 => "aarch64",
-            Arch::Armhf => "arm",
-            Arch::Riscv64 => "riscv64",
-            Arch::Ppc64el => "ppc",
-            Arch::S390x => "s390x",
-            Arch::Unknown => "unknown",
-        }
-    }
 }
 
 /// Get the host system architecture using uname(2) syscall
@@ -224,58 +182,6 @@ pub fn detect_shell(rootfs: &Path) -> &'static str {
     }
 }
 
-// ============================================================================
-// Memory string validation
-// ============================================================================
-
-/// Validate a QEMU memory size string (e.g., "512M", "2G")
-/// Returns an error if the format is invalid
-pub fn validate_memory_string(s: &str) -> Result<()> {
-    if s.is_empty() {
-        return Err(anyhow!("Memory size cannot be empty").into());
-    }
-
-    // Must end with a valid suffix or be a plain number
-    let suffix = s.chars().last().unwrap();
-    let has_suffix = suffix.is_ascii_alphabetic();
-
-    let numeric_part = if has_suffix { &s[..s.len() - 1] } else { s };
-
-    // Check for negative numbers
-    if numeric_part.starts_with('-') {
-        return Err(anyhow!("Memory size cannot be negative: {}", s).into());
-    }
-
-    // Must be a valid positive number
-    if numeric_part.is_empty() {
-        return Err(anyhow!("Memory size must have a numeric value: {}", s).into());
-    }
-
-    // Check if it's a valid integer
-    if !numeric_part.chars().all(|c| c.is_ascii_digit()) {
-        return Err(anyhow!(
-            "Memory size must be a positive integer with optional suffix: {}",
-            s
-        )
-        .into());
-    }
-
-    // Check suffix is valid
-    if has_suffix {
-        let valid_suffixes = ['K', 'M', 'G', 'T'];
-        let suffix_upper = suffix.to_ascii_uppercase();
-        if !valid_suffixes.contains(&suffix_upper) {
-            return Err(anyhow!(
-                "Invalid memory suffix '{}'. Valid suffixes: K, M, G, T",
-                suffix
-            )
-            .into());
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,25 +212,5 @@ mod tests {
         assert_eq!(Arch::Amd64.oci_name(), "amd64");
         assert_eq!(Arch::Arm64.oci_name(), "arm64");
         assert_eq!(Arch::Armhf.oci_name(), "arm");
-    }
-
-    #[test]
-    fn test_validate_memory_string_valid() {
-        assert!(validate_memory_string("512M").is_ok());
-        assert!(validate_memory_string("2G").is_ok());
-        assert!(validate_memory_string("1024").is_ok());
-        assert!(validate_memory_string("1T").is_ok());
-        assert!(validate_memory_string("256K").is_ok());
-        assert!(validate_memory_string("2g").is_ok()); // lowercase
-    }
-
-    #[test]
-    fn test_validate_memory_string_invalid() {
-        assert!(validate_memory_string("").is_err());
-        assert!(validate_memory_string("-1G").is_err());
-        assert!(validate_memory_string("2X").is_err());
-        assert!(validate_memory_string("abc").is_err());
-        assert!(validate_memory_string("G").is_err());
-        assert!(validate_memory_string("1.5G").is_err());
     }
 }
