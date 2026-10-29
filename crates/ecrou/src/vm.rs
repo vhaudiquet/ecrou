@@ -179,7 +179,7 @@ pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32
         })
         .transpose()
         .map_err(Error::Other)?;
-    let share_pairs = collect_shares(rootfs, options, capture_share).map_err(Error::Other)?;
+    let share_pairs = collect_shares(rootfs.dir(), options, capture_share).map_err(Error::Other)?;
     let shares = share_pairs
         .iter()
         .map(|(_, gs)| gs.clone())
@@ -299,7 +299,7 @@ pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32
 /// must exist, and no share may overlap the scratch rootfs, or the
 /// guest could rewrite its own init.
 fn collect_shares(
-    rootfs: &PreparedRootfs,
+    rootfs_dir: &std::path::Path,
     options: &RunOptions,
     capture: Option<Share>,
 ) -> anyhow::Result<Vec<(Share, GuestShare)>> {
@@ -308,6 +308,7 @@ fn collect_shares(
         all.push(ws.clone());
     }
     all.extend(options.shares.iter().cloned());
+    let caller_count = all.len();
     // The capture share rides last, after every caller share.
     if let Some(cap) = capture {
         all.push(cap);
@@ -321,11 +322,17 @@ fn collect_shares(
                 share.host.display()
             ));
         }
-        if rootfs.dir().starts_with(&share.host) || share.host.starts_with(rootfs.dir()) {
+        if rootfs_dir.starts_with(&share.host) || share.host.starts_with(rootfs_dir) {
             return Err(anyhow!(
                 "share {} overlaps the scratch rootfs",
                 share.host.display()
             ));
+        }
+        // The capture share owns the reserved namespace by design;
+        // caller shares may not touch it, or a mount would shadow the
+        // control paths the init and the exit handshake rely on.
+        if i < caller_count {
+            reject_reserved_namespace(&share.guest)?;
         }
         out.push((
             share.clone(),
@@ -337,6 +344,32 @@ fn collect_shares(
         ));
     }
     Ok(out)
+}
+
+/// Reject a caller share whose guest target would shadow a reserved
+/// guest path: the capture directory and the exit file. Equal to a
+/// reserved path, inside one, or containing one (a share at `/`
+/// shadows everything) are all refused.
+fn reject_reserved_namespace(target: &str) -> anyhow::Result<()> {
+    let reserved = [crate::guest::CAPTURE_DIR, crate::guest::EXIT_FILE];
+    if target == "/" {
+        return Err(anyhow!(
+            "share target / is reserved by ecrou: it would shadow {} and {}",
+            crate::guest::CAPTURE_DIR,
+            crate::guest::EXIT_FILE
+        ));
+    }
+    for path in reserved {
+        if target == path
+            || target.starts_with(&format!("{path}/"))
+            || path.starts_with(&format!("{target}/"))
+        {
+            return Err(anyhow!(
+                "share target {target} is reserved by ecrou ({path}); pick another guest path"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The guest payload: the caller's argv, or the rootfs's default shell.
@@ -441,6 +474,69 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("bin")).unwrap();
         std::fs::write(dir.path().join("bin/sh"), "").unwrap();
         dir
+    }
+
+    #[test]
+    fn caller_shares_cannot_take_the_reserved_namespace() {
+        let scratch = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+
+        let share = |guest: &str| Share {
+            host: host.path().to_path_buf(),
+            guest: guest.to_string(),
+            read_only: true,
+        };
+        // Equal to a reserved path, inside one, or containing one.
+        for guest in [
+            crate::guest::CAPTURE_DIR,
+            &format!("{}/stdout", crate::guest::CAPTURE_DIR),
+            crate::guest::EXIT_FILE,
+            "/",
+        ] {
+            let options = RunOptions {
+                shares: vec![share(guest)],
+                ..Default::default()
+            };
+            let err = format!(
+                "{:#}",
+                collect_shares(scratch.path(), &options, None).unwrap_err()
+            );
+            assert!(err.contains("reserved by ecrou"), "{err}");
+        }
+        // The workspace is a caller share like any other.
+        let options = RunOptions {
+            workspace: Some(share(crate::guest::CAPTURE_DIR)),
+            ..Default::default()
+        };
+        let err = format!(
+            "{:#}",
+            collect_shares(scratch.path(), &options, None).unwrap_err()
+        );
+        assert!(err.contains("reserved by ecrou"), "{err}");
+    }
+
+    #[test]
+    fn the_capture_share_may_use_the_reserved_namespace() {
+        let scratch = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+
+        let options = RunOptions {
+            workspace: Some(Share {
+                host: host.path().to_path_buf(),
+                guest: "/workspace".to_string(),
+                read_only: false,
+            }),
+            ..Default::default()
+        };
+        let capture = Share {
+            host: host.path().join("out"),
+            guest: crate::guest::CAPTURE_DIR.to_string(),
+            read_only: false,
+        };
+        std::fs::create_dir_all(host.path().join("out")).unwrap();
+        let pairs = collect_shares(scratch.path(), &options, Some(capture)).unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[1].1.target, crate::guest::CAPTURE_DIR);
     }
 
     #[test]
