@@ -12,10 +12,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
 
+use crate::cache::RootfsCache;
 use crate::guest::{self, GuestShare};
 use crate::krun::{self, Krun};
 use crate::progress::Progress;
-use crate::rootfs::{PrepareRequest, PreparedRootfs, RootfsCache};
+use crate::rootfs::{PrepareRequest, PreparedRootfs};
 use crate::utils::{self, HOSTNAME_SUFFIX_LEN};
 use crate::{Error, Result};
 

@@ -47,6 +47,24 @@ impl Distro {
     }
 }
 
+/// Parse an image reference and resolve floating version aliases ("latest",
+/// "lts", "edge", …) to a concrete version, so the cache key is stable
+/// (e.g. "ubuntu-noble-amd64", not "ubuntu-latest-amd64") and a future
+/// release automatically gets its own cache entry.
+pub(crate) fn resolve_source(image: &str, arch: &str) -> anyhow::Result<ImageSource> {
+    let source = parse_image_ref(image, arch)?;
+    match source {
+        ImageSource::DirectTarball { distro, version } => {
+            let resolved = resolve_distro_version(&distro, version.as_deref(), arch)?;
+            Ok(ImageSource::DirectTarball {
+                distro,
+                version: Some(resolved),
+            })
+        }
+        other => Ok(other),
+    }
+}
+
 /// Parse image reference and return the appropriate source
 /// Supports:
 /// - Simple distro names: ubuntu, debian, alpine

@@ -37,7 +37,8 @@ fn cmd_provision(
     command: &[String],
     cli_verbose: bool,
 ) -> std::process::ExitCode {
-    use ecrou::rootfs::{PrepareRequest, RootfsCache};
+    use ecrou::cache::RootfsCache;
+    use ecrou::rootfs::PrepareRequest;
     use ecrou::spec::ProvisionSpec;
 
     // Two shapes: `provision IMAGE -- COMMAND` bakes a one-off
@@ -251,7 +252,7 @@ fn cmd_probe() -> std::process::ExitCode {
     }
 
     print!("cache:        ");
-    match ecrou::rootfs::RootfsCache::default_dir() {
+    match ecrou::cache::RootfsCache::default_dir() {
         Ok(dir) => {
             // The run flow creates the cache on demand; probe mirrors it.
             if let Err(err) = std::fs::create_dir_all(&dir) {

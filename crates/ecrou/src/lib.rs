@@ -31,6 +31,7 @@
 //! embeds the library exactly the way the CLI does - a [`RootfsCache`]
 //! to prepare a rootfs, then [`run`] to boot it.
 
+pub mod cache;
 pub mod distro;
 pub mod download;
 pub mod error;
@@ -46,7 +47,8 @@ mod supervise;
 pub mod utils;
 pub mod vm;
 
+pub use cache::RootfsCache;
 pub use error::{Error, Result};
 pub use progress::{NoProgress, Progress, Unit};
-pub use rootfs::{PrepareRequest, PreparedRootfs, RootfsCache};
+pub use rootfs::{PrepareRequest, PreparedRootfs};
 pub use vm::{run, LogLevel, RunOptions, Share};
