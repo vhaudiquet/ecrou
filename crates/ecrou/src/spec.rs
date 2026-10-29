@@ -6,7 +6,7 @@
 use serde::Deserialize;
 use std::fmt::Write as _;
 
-/// A parsed `.rhema/image.yaml` (or any consumer's equivalent).
+/// A parsed provisioning spec file (YAML: base, packages, run).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ProvisionSpec {
     /// The image to provision over. Optional: without it the caller's
@@ -99,12 +99,12 @@ mod tests {
         assert!(spec.base.is_none());
 
         let full = ProvisionSpec::parse(
-            b"base: ghcr.io/vhaudiquet/rhema-base:v1\npackages:\n  - go\nrun: |\n  cargo install just\n",
+            b"base: ghcr.io/example/base:v1\npackages:\n  - go\nrun: |\n  cargo install just\n",
         )
         .expect("parses");
         assert_eq!(
             full.base.as_deref(),
-            Some("ghcr.io/vhaudiquet/rhema-base:v1")
+            Some("ghcr.io/example/base:v1")
         );
         assert!(full.run.as_deref().unwrap().contains("cargo install"));
 
