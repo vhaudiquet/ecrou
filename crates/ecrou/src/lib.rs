@@ -37,6 +37,7 @@ pub mod error;
 pub mod extract;
 pub mod guest;
 pub mod krun;
+mod pack;
 pub mod progress;
 mod registry;
 pub mod rootfs;
