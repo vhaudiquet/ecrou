@@ -376,6 +376,33 @@ libkrun binary behind strict confinement running a VM. T1 is the gate
 that proves the shape under real AppArmor and seccomp, and everything
 else in this document is design until it passes.
 
+## Trust model
+
+What a downloaded image is trusted to be, and where the guarantees
+stop:
+
+- Every fetch rides TLS; the trust anchor is the host CA set. There is
+  no signature pinning, so a hostile CA or a local interceptor holding
+  a trusted certificate is outside what the download code defends
+  against.
+- OCI layers are content-addressed: each blob is hashed as it streams
+  and verified against the digest in the architecture manifest, and
+  the architecture manifest is verified against its digest entry in
+  the manifest list. The list itself is only TLS-authenticated, the
+  same as a plain `docker pull`.
+- Direct distro tarballs are checked against the checksum the distro
+  publishes next to them. When the checksum artifact cannot be fetched
+  the download proceeds unverified with a warning instead of
+  hard-failing. That is a deliberate trade, not an oversight.
+- The cache trusts its own entries. Once written, an entry is never
+  re-verified, except OCI `:latest` tags, which are re-checked against
+  the registry digest on every run. Pinned tags and distro tarballs are
+  assumed immutable; `--no-cache` and the digest-changed path are the
+  escape hatches.
+- Concurrent runs of the same image are safe, not efficient: each
+  writes its own partial file and the last atomic rename wins, so two
+  racers download twice rather than corrupt anything.
+
 ## Falsification tests
 
 - **T1, confinement.** The spike snap runs `ecrou run alpine -- uname
