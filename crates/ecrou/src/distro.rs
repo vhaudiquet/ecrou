@@ -25,6 +25,10 @@ pub enum ImageSource {
         registry: String,
         repository: String,
         tag: String,
+        /// A digest pin (`sha256:…`), when the reference carries one
+        /// (`repo:tag@sha256:…` or `repo@sha256:…`): the manifest is
+        /// fetched by digest and the image is immutable by definition.
+        digest: Option<String>,
         architecture: String,
     },
     /// A rootfs archive on the host filesystem, named with a path
@@ -49,6 +53,7 @@ impl Distro {
 /// - Distro with version: ubuntu:noble, alpine:3.19
 /// - OCI image references: docker://ubuntu:latest, quay.io/centos/centos:stream9
 /// - Docker Hub shorthand: ubuntu:latest (without registry prefix)
+/// - Digest pins, as docker accepts them: ubuntu@sha256:…, repo:tag@sha256:…
 pub fn parse_image_ref(input: &str, arch: &str) -> Result<ImageSource> {
     let input = input.trim();
 
@@ -94,6 +99,7 @@ pub fn parse_image_ref(input: &str, arch: &str) -> Result<ImageSource> {
                 registry: "docker.io".to_string(),
                 repository: "library/archlinux".to_string(),
                 tag: version.unwrap_or_else(|| "latest".to_string()),
+                digest: None,
                 architecture: oci_arch,
             })
         }
@@ -104,6 +110,7 @@ pub fn parse_image_ref(input: &str, arch: &str) -> Result<ImageSource> {
                 registry: "docker.io".to_string(),
                 repository: "gentoo/stage3".to_string(),
                 tag: version.unwrap_or_else(|| "latest".to_string()),
+                digest: None,
                 architecture: oci_arch,
             })
         }
@@ -112,26 +119,37 @@ pub fn parse_image_ref(input: &str, arch: &str) -> Result<ImageSource> {
     }
 }
 
-/// Parse OCI image reference (registry/repo:tag or repo:tag)
+/// Parse OCI image reference (registry/repo:tag[@digest] or repo:tag[@digest])
 fn parse_oci_ref(input: &str, arch: &str) -> anyhow::Result<ImageSource> {
+    // Split off a digest pin first: '@' after the last '/' introduces
+    // `algo:hex`, which itself contains a colon, so it must be peeled
+    // before tag splitting.  Docker accepts `repo:tag@digest` (digest
+    // wins) and bare `repo@digest`; so do we.
+    let (without_digest, digest) = match digest_separator(input) {
+        Some(at) => (
+            &input[..at],
+            Some(validate_digest(&input[at + 1..]).map_err(anyhow::Error::msg)?),
+        ),
+        None => (input, None),
+    };
     // Split off the tag.  A ':' is a tag separator only when it appears after
     // the last '/'; any ':' before a '/' is a port number
     // (e.g. localhost:5000/image).  With no '/' the single ':' is the tag.
-    let (without_tag, tag) = if let Some(slash_pos) = input.rfind('/') {
-        let after_slash = &input[slash_pos + 1..];
+    let (without_tag, tag) = if let Some(slash_pos) = without_digest.rfind('/') {
+        let after_slash = &without_digest[slash_pos + 1..];
         if let Some(colon_pos) = after_slash.find(':') {
             (
-                &input[..slash_pos + 1 + colon_pos],
-                input[slash_pos + 1 + colon_pos + 1..].to_string(),
+                &without_digest[..slash_pos + 1 + colon_pos],
+                without_digest[slash_pos + 1 + colon_pos + 1..].to_string(),
             )
         } else {
-            (input, "latest".to_string())
+            (without_digest, "latest".to_string())
         }
     } else {
         // No slash: bare "ubuntu" or "ubuntu:latest"
-        match input.split_once(':') {
+        match without_digest.split_once(':') {
             Some((name, t)) => (name, t.to_string()),
-            None => (input, "latest".to_string()),
+            None => (without_digest, "latest".to_string()),
         }
     };
 
@@ -157,8 +175,44 @@ fn parse_oci_ref(input: &str, arch: &str) -> anyhow::Result<ImageSource> {
         registry,
         repository,
         tag,
+        digest,
         architecture: oci_arch,
     })
+}
+
+/// Byte offset of the digest separator ('@' after the last '/'), if the
+/// reference carries a digest pin. '@' is not legal in registries,
+/// repositories, or tags, so the first one after the last '/' is
+/// unambiguous.
+fn digest_separator(input: &str) -> Option<usize> {
+    let after_slash = match input.rfind('/') {
+        Some(slash) => &input[slash + 1..],
+        None => input,
+    };
+    after_slash
+        .find('@')
+        .map(|at| input.len() - after_slash.len() + at)
+}
+
+/// Validate a digest pin: `algo:hex`, hex at least 32 digits — sha256
+/// and sha512 are the digests registries actually issue. Returns the
+/// lowercased digest.
+fn validate_digest(digest: &str) -> anyhow::Result<String> {
+    let (algo, hex) = digest
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid image digest {digest:?}: expected algo:hex"))?;
+    let ok = !algo.is_empty()
+        && algo
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && hex.len() >= 32
+        && hex.chars().all(|c| c.is_ascii_hexdigit());
+    if !ok {
+        return Err(anyhow::anyhow!(
+            "invalid image digest {digest:?}: expected e.g. sha256:<64 hex digits>"
+        ));
+    }
+    Ok(format!("{}:{}", algo, hex.to_lowercase()))
 }
 
 /// Map architecture to OCI standard names
@@ -480,6 +534,7 @@ mod tests {
             registry: registry.to_string(),
             repository: repository.to_string(),
             tag: tag.to_string(),
+            digest: None,
             architecture: "amd64".to_string(),
         }
     }
@@ -573,6 +628,68 @@ mod tests {
             parse_image_ref("/tmp/rootfs.tar.zst", "amd64").expect("parses"),
             local("/tmp/rootfs.tar.zst")
         );
+    }
+
+    const SHA256_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    #[test]
+    fn digest_pins_parse_like_docker_references() {
+        // Bare digest ref
+        let src = parse(&format!("ubuntu@sha256:{SHA256_ABC}"));
+        let ImageSource::OciImage {
+            registry,
+            repository,
+            tag,
+            digest,
+            ..
+        } = src
+        else {
+            panic!("expected OCI source");
+        };
+        assert_eq!(registry, "docker.io");
+        assert_eq!(repository, "library/ubuntu");
+        assert_eq!(tag, "latest");
+        assert_eq!(
+            digest.as_deref(),
+            Some(format!("sha256:{SHA256_ABC}").as_str())
+        );
+
+        // Tag + digest: the digest wins, the tag rides along
+        let src = parse(&format!("ubuntu:24.04@sha256:{SHA256_ABC}"));
+        let ImageSource::OciImage { tag, digest, .. } = src else {
+            panic!("expected OCI source");
+        };
+        assert_eq!(tag, "24.04");
+        assert!(digest.is_some());
+
+        // Registry-qualified digest ref, port included
+        let src = parse(&format!("localhost:5000/org/img@sha256:{SHA256_ABC}"));
+        let ImageSource::OciImage {
+            registry,
+            repository,
+            digest,
+            ..
+        } = src
+        else {
+            panic!("expected OCI source");
+        };
+        assert_eq!(registry, "localhost:5000");
+        assert_eq!(repository, "org/img");
+        assert!(digest.is_some());
+    }
+
+    #[test]
+    fn malformed_digests_are_named_errors() {
+        for bad in [
+            "ubuntu@sha256:tooshort",
+            "ubuntu@sha256",
+            "ubuntu@sha256:zz7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ] {
+            assert!(
+                parse_image_ref(&format!("docker://{bad}"), "amd64").is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

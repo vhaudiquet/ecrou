@@ -299,10 +299,12 @@ ecrou probe
 ```
 
 The image is a distro name (`alpine`, `ubuntu:noble`), an OCI
-reference (`ghcr.io/org/image:tag`), or a local rootfs archive named
-with a path (`./rootfs.tar.gz`, `/tmp/rootfs.tar`): a path reference is
-read in place on every run, never downloaded and never cached as a
-pristine entry.
+reference (`ghcr.io/org/image:tag`, `ubuntu@sha256:…`,
+`repo:tag@sha256:…` — the digest wins over a co-present tag, as in
+docker), or a local rootfs archive named with a path
+(`./rootfs.tar.gz`, `/tmp/rootfs.tar`): a path reference is read in
+place on every run, never downloaded and never cached as a pristine
+entry.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -394,9 +396,9 @@ stop:
   hard-failing. That is a deliberate trade, not an oversight.
 - The cache trusts its own entries. Once written, an entry is never
   re-verified, except OCI `:latest` tags, which are re-checked against
-  the registry digest on every run. Pinned tags and distro tarballs are
-  assumed immutable; `--no-cache` and the digest-changed path are the
-  escape hatches.
+  the registry digest on every run. Digest pins, pinned tags and
+  distro tarballs are assumed immutable; `--no-cache` and the
+  digest-changed path are the escape hatches.
 - Concurrent runs of the same image are safe, not efficient: each
   writes its own partial file and the last atomic rename wins, so two
   racers download twice rather than corrupt anything.

@@ -63,21 +63,26 @@ fn fetch_oci_digest_inner(registry: &str, repository: &str, tag: &str) -> anyhow
         .ok_or_else(|| anyhow!("Registry did not return a Docker-Content-Digest header"))
 }
 
-pub(crate) fn download_oci_image(
-    registry: &str,
-    repository: &str,
-    tag: &str,
-    arch: &str,
-    dest: &Path,
-    progress: &dyn Progress,
-) -> anyhow::Result<()> {
+/// What a pull needs: the parsed reference and where the bundle lands.
+pub(crate) struct OciPull<'a> {
+    pub registry: &'a str,
+    pub repository: &'a str,
+    pub tag: &'a str,
+    /// A digest pin: the manifest is fetched by digest and the tag,
+    /// when present too, is ignored the way docker ignores it.
+    pub digest: Option<&'a str>,
+    pub architecture: &'a str,
+    pub dest: &'a Path,
+}
+
+pub(crate) fn download_oci_image(pull: &OciPull, progress: &dyn Progress) -> anyhow::Result<()> {
     let client = http_client(None)?;
-    let digest = try_download_oci_image(&client, registry, repository, tag, arch, dest, progress)?;
+    let digest = try_download_oci_image(&client, pull, progress)?;
 
     // Persist the manifest digest so the next run can skip the download when
     // the tag hasn't changed (see fetch_oci_digest / digest_sidecar).
     if !digest.is_empty() {
-        let _ = std::fs::write(digest_sidecar(dest), &digest);
+        let _ = std::fs::write(digest_sidecar(pull.dest), &digest);
     }
 
     Ok(())
@@ -85,25 +90,35 @@ pub(crate) fn download_oci_image(
 
 fn try_download_oci_image(
     client: &Client,
-    registry: &str,
-    repository: &str,
-    tag: &str,
-    arch: &str,
-    dest: &Path,
+    pull: &OciPull,
     progress: &dyn Progress,
 ) -> anyhow::Result<String> {
+    let OciPull {
+        registry,
+        repository,
+        tag,
+        digest: digest_pin,
+        architecture: arch,
+        dest,
+    } = *pull;
     // Get authentication token for the registry
     let token = get_auth_token(client, registry, repository)?;
 
-    // Construct manifest URL based on registry
+    // A digest pin fetches the manifest by digest — the pin IS the
+    // reference; the tag, when present too, is ignored the way docker
+    // ignores it. Otherwise the tag names the manifest.
+    let reference = digest_pin.unwrap_or(tag);
     let manifest_url = if registry == "docker.io" {
         // Docker Hub uses registry-1.docker.io for API
         format!(
             "https://registry-1.docker.io/v2/{}/manifests/{}",
-            repository, tag
+            repository, reference
         )
     } else {
-        format!("https://{}/v2/{}/manifests/{}", registry, repository, tag)
+        format!(
+            "https://{}/v2/{}/manifests/{}",
+            registry, repository, reference
+        )
     };
 
     log::debug!("Fetching manifest from: {}", manifest_url);
@@ -123,10 +138,11 @@ fn try_download_oci_image(
         ));
     }
 
-    // Capture the tag-level digest before consuming the response body.
-    // This is the content-addressable identity of the manifest (or manifest
-    // list) at this tag — used to detect whether the tag has moved since the
-    // last download.
+    // Capture the reference-level digest before consuming the response
+    // body. This is the content-addressable identity of the manifest (or
+    // manifest list) at this tag — used to detect whether the tag has
+    // moved since the last download. For a digest pin it is the pin
+    // itself, and the freshness machinery never consults it.
     let tag_digest = response
         .headers()
         .get("Docker-Content-Digest")

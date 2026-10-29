@@ -143,17 +143,19 @@ pub fn download_image(
             registry,
             repository,
             tag,
+            digest,
             architecture,
         } => {
             log::debug!("Pulling OCI image: {}/{}:{}", registry, repository, tag);
-            crate::registry::download_oci_image(
+            let pull = crate::registry::OciPull {
                 registry,
                 repository,
                 tag,
+                digest: digest.as_deref(),
                 architecture,
                 dest,
-                progress,
-            )?;
+            };
+            crate::registry::download_oci_image(&pull, progress)?;
             Ok(())
         }
         // A local archive is read in place by the prepare step; there

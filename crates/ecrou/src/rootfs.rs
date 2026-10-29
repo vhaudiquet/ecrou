@@ -83,12 +83,14 @@ fn oci_freshness_changed(source: &ImageSource, cache_path: &Path) -> bool {
         registry,
         repository,
         tag,
+        digest,
         ..
     } = source
     else {
         return false;
     };
-    if tag != "latest" {
+    // A digest pin is immutable by definition; so is any non-latest tag.
+    if digest.is_some() || tag != "latest" {
         return false;
     }
     match fetch_oci_digest(registry, repository, tag) {
@@ -637,14 +639,18 @@ fn generate_cache_filename(source: &ImageSource, arch: &str) -> String {
             registry,
             repository,
             tag,
+            digest,
             architecture,
         } => {
-            // Sanitize for filename
+            // Sanitize for filename. A digest pin replaces the tag in
+            // the name: two references differing only by pin must not
+            // share an entry.
             let safe_registry = registry.replace(['.', ':'], "_");
             let safe_repo = repository.replace(['/', ':'], "_");
+            let reference = digest.as_deref().unwrap_or(tag).replace(':', "_");
             format!(
                 "oci-{}-{}-{}-{}.tar.gz",
-                safe_registry, safe_repo, tag, architecture
+                safe_registry, safe_repo, reference, architecture
             )
         }
         ImageSource::LocalTarball { path } => {
@@ -736,6 +742,7 @@ mod tests {
             registry: "docker.io".to_string(),
             repository: "library/ubuntu".to_string(),
             tag: "latest".to_string(),
+            digest: None,
             architecture: "amd64".to_string(),
         };
         assert_eq!(
@@ -907,6 +914,36 @@ mod tests {
             .unwrap()
             .to_string();
         assert_ne!(empty_name, grown);
+    }
+
+    #[test]
+    fn a_digest_pin_names_its_own_cache_entry() {
+        let cache = RootfsCache::new(std::path::PathBuf::from("/cache"));
+        let tagged = crate::distro::parse_image_ref("ubuntu:24.04", "amd64").unwrap();
+        let pinned = crate::distro::parse_image_ref(
+            "ubuntu:24.04@sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "amd64",
+        )
+        .unwrap();
+        assert_ne!(
+            cache.tarball_path(&tagged, "amd64"),
+            cache.tarball_path(&pinned, "amd64"),
+            "a pin must not share the tag's entry"
+        );
+    }
+
+    #[test]
+    fn a_digest_pin_is_never_checked_for_freshness() {
+        // Even with a :latest tag riding along, the pin wins: this
+        // must return without any registry contact (it would hang the
+        // test suite offline if it tried).
+        let pinned = crate::distro::parse_image_ref(
+            "ubuntu:latest@sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "amd64",
+        )
+        .unwrap();
+        let existing = tempfile::NamedTempFile::new().unwrap();
+        assert!(!oci_freshness_changed(&pinned, existing.path()));
     }
 
     #[test]
