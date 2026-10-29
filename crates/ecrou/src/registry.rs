@@ -487,18 +487,22 @@ fn download_blob_with_auth(
     }
 
     file.flush().context("Failed to flush the layer file")?;
-    progress.finish();
 
     // The blob was addressed by this digest in the manifest; a mismatch means
     // truncated or tampered content.  The blob lives in a temp directory that
     // is discarded on error, so a bad layer never reaches the cache.
-    hasher.verify(Some(expected_digest)).with_context(|| {
+    let verified = hasher.verify(Some(expected_digest)).with_context(|| {
         format!(
             "layer blob {} failed verification against manifest digest",
             url
         )
-    })?;
+    });
 
+    // The operation ended — success or not. A sink is told finish()
+    // exactly once per begin(), so a failed layer leaves no bar
+    // hanging and no implicit open operation behind it.
+    progress.finish();
+    verified?;
     Ok(())
 }
 

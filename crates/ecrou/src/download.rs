@@ -257,7 +257,6 @@ fn download_file(
             progress.advance(n as u64);
         }
 
-        progress.finish();
         hasher.verify(expected)?;
         if expected.is_some() {
             log::debug!("Verified content digest: {}", dest.display());
@@ -269,6 +268,11 @@ fn download_file(
 
         Ok(())
     })();
+
+    // The operation ended — success or not. A sink is told finish()
+    // exactly once per begin(), so a failed transfer leaves no bar
+    // hanging and no implicit open operation behind it.
+    progress.finish();
 
     if result.is_err() {
         // Best-effort cleanup; ignore errors (file may not exist if creation failed).
