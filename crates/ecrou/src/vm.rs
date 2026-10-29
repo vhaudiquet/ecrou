@@ -264,6 +264,14 @@ pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32
             .with_context(|| format!("creating {}", console_path.display()))?;
     }
 
+    // The parent holds the terminal's mode across an interactive
+    // machine: libkrun restores through the child's exit observers,
+    // which a SIGKILLed machine never runs. The save happens before the
+    // fork because the child can reach raw mode at any moment after it;
+    // a save after the fork could capture libkrun's mode and restore
+    // that. (Only a tty is saved, so a piped -i run is a no-op here.)
+    let tty_restore = TtyRestore::save(interactive);
+
     // Fork with no other threads alive: the child only touches libkrun
     // configuration before entering the VM loop, which never returns (a
     // normal payload exit ends the child through the VMM's own exit).
@@ -321,11 +329,6 @@ pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32
         ));
     }
 
-    // The parent holds the terminal's mode across an interactive
-    // machine: libkrun restores through the child's exit observers,
-    // which a SIGKILLed machine never runs. (Only a tty is saved, so a
-    // piped -i run is a no-op here.)
-    let tty_restore = TtyRestore::save(interactive);
     let result = if interactive {
         wait_machine(
             child,
@@ -405,7 +408,16 @@ fn stream_console(
         // both reports and reaps.
         let mut status: libc::c_int = 0;
         // Safety: waitpid with WNOHANG only; the pid is our own child.
-        let r = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+        let r = loop {
+            let r = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+            // A caught signal must not abort the run and orphan the
+            // machine: EINTR only says look again.
+            if r == -1 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            break r;
+        };
         if r == child {
             reaped.store(status, std::sync::atomic::Ordering::SeqCst);
             done = true;
@@ -452,7 +464,15 @@ fn wait_machine(
     let mut status: libc::c_int = 0;
     // Safety: waitpid on our own child; the pointer points at valid
     // storage.
-    let ret = unsafe { libc::waitpid(child, &mut status, 0) };
+    let ret = loop {
+        let r = unsafe { libc::waitpid(child, &mut status, 0) };
+        // EINTR: a caught signal interrupts the wait, it does not end
+        // it. Retry instead of erroring out and orphaning the machine.
+        if r == -1 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break r;
+    };
     if ret < 0 {
         return Err(Error::Other(
             anyhow::Error::from(std::io::Error::last_os_error())
