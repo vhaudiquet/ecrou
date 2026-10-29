@@ -250,36 +250,131 @@ pub fn checksum_artifact_url(distro: &Distro, tarball_url: &str) -> Option<Strin
     }
 }
 
-/// Fetch the latest Ubuntu codename from a changelogs.ubuntu.com meta-release file.
-/// Pass the LTS-only URL to get the latest LTS, or the full URL for the latest release.
-fn fetch_ubuntu_codename(meta_release_url: &str) -> anyhow::Result<String> {
-    let client = crate::download::http_client(Some(Duration::from_secs(30)))?;
-    let text = client
-        .get(meta_release_url)
-        .send()
-        .with_context(|| format!("Failed to fetch {}", meta_release_url))?
-        .text()
-        .with_context(|| format!("Failed to read {}", meta_release_url))?;
+/// Ubuntu releases with base images: `(codename, YY.MM)`, oldest
+/// first. Static on purpose — `ubuntu:26.04` and `ubuntu:resolute`
+/// must resolve identically and offline, and a codename never changes
+/// meaning. A newer release than this table needs an entry only for
+/// its codename; its number always resolves without one.
+const UBUNTU_CODENAMES: &[(&str, &str)] = &[
+    ("xenial", "16.04"),
+    ("bionic", "18.04"),
+    ("cosmic", "18.10"),
+    ("disco", "19.04"),
+    ("eoan", "19.10"),
+    ("focal", "20.04"),
+    ("groovy", "20.10"),
+    ("hirsute", "21.04"),
+    ("impish", "21.10"),
+    ("jammy", "22.04"),
+    ("kinetic", "22.10"),
+    ("lunar", "23.04"),
+    ("mantic", "23.10"),
+    ("noble", "24.04"),
+    ("oracular", "24.10"),
+    ("plucky", "25.04"),
+    ("questing", "25.10"),
+    ("resolute", "26.04"),
+];
 
-    let mut current_dist: Option<String> = None;
-    let mut latest: Option<String> = None;
+/// One entry of a meta-release file.
+#[derive(Debug, Clone, PartialEq)]
+struct UbuntuRelease {
+    codename: String,
+    number: String,
+    supported: bool,
+}
 
-    for line in text.lines() {
-        if let Some(dist) = line.strip_prefix("Dist: ") {
-            current_dist = Some(dist.trim().to_string());
-        } else if line.trim_start().starts_with("Supported: 1") {
-            if let Some(dist) = current_dist.take() {
-                latest = Some(dist);
+/// Parse a changelogs.ubuntu.com meta-release body into releases, in
+/// file order (oldest first).
+fn parse_ubuntu_meta_release(text: &str) -> Vec<UbuntuRelease> {
+    let mut releases = Vec::new();
+    let mut current: Option<(String, String, bool)> = None;
+
+    fn flush(current: &mut Option<(String, String, bool)>, releases: &mut Vec<UbuntuRelease>) {
+        if let Some((codename, number, supported)) = current.take() {
+            if !number.is_empty() {
+                releases.push(UbuntuRelease {
+                    codename,
+                    number,
+                    supported,
+                });
             }
         }
     }
 
-    latest.ok_or_else(|| {
-        anyhow!(
-            "Could not determine Ubuntu codename from {}",
-            meta_release_url
-        )
-    })
+    for line in text.lines() {
+        if let Some(dist) = line.strip_prefix("Dist: ") {
+            flush(&mut current, &mut releases);
+            current = Some((dist.trim().to_string(), String::new(), false));
+        } else if let Some(version) = line.strip_prefix("Version: ") {
+            // "22.04", "22.04 LTS", "24.04.1 LTS" — normalise to YY.MM,
+            // the granularity ubuntu-base publishes.
+            let raw = version.split_whitespace().next().unwrap_or("");
+            if let Some((_, number, _)) = current.as_mut() {
+                *number = normalise_ubuntu_number(raw);
+            }
+        } else if line.trim_start().starts_with("Supported: 1") {
+            if let Some((_, _, supported)) = current.as_mut() {
+                *supported = true;
+            }
+        }
+    }
+    flush(&mut current, &mut releases);
+    releases
+}
+
+/// Fetch a meta-release file and return its releases.
+fn fetch_ubuntu_meta_releases(url: &str) -> anyhow::Result<Vec<UbuntuRelease>> {
+    let client = crate::download::http_client(Some(Duration::from_secs(30)))?;
+    let text = client
+        .get(url)
+        .send()
+        .with_context(|| format!("Failed to fetch {}", url))?
+        .text()
+        .with_context(|| format!("Failed to read {}", url))?;
+    Ok(parse_ubuntu_meta_release(&text))
+}
+
+/// The YY.MM number of the newest supported release in a meta-release file.
+/// Pass the LTS-only URL for the latest LTS, the full URL for the latest
+/// release.
+fn fetch_ubuntu_latest_number(url: &str) -> anyhow::Result<String> {
+    fetch_ubuntu_meta_releases(url)?
+        .into_iter()
+        .filter(|r| r.supported)
+        .next_back()
+        .map(|r| r.number)
+        .ok_or_else(|| anyhow!("no supported Ubuntu release listed in {}", url))
+}
+
+/// "24.04.1" names the same base release as "24.04": ubuntu-base
+/// publishes one tarball per YY.MM series.
+fn normalise_ubuntu_number(raw: &str) -> String {
+    let mut parts = raw.splitn(3, '.');
+    match (parts.next(), parts.next()) {
+        (Some(a), Some(b)) => format!("{a}.{b}"),
+        _ => raw.to_string(),
+    }
+}
+
+/// A codename becomes its YY.MM number: from the static table, or —
+/// for a release younger than this build's table — from meta-release.
+fn ubuntu_codename_to_number(codename: &str) -> anyhow::Result<String> {
+    let lower = codename.to_lowercase();
+    if let Some((_, number)) = UBUNTU_CODENAMES.iter().find(|(name, _)| *name == lower) {
+        return Ok((*number).to_string());
+    }
+    let releases = fetch_ubuntu_meta_releases("https://changelogs.ubuntu.com/meta-release")?;
+    releases
+        .iter()
+        .find(|r| r.codename == lower)
+        .map(|r| r.number.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "Unknown Ubuntu version {codename:?}: use the YY.MM number (e.g. 26.04) \
+                 or a known codename (e.g. resolute, noble)"
+            )
+        })
 }
 
 /// Fetch the current Alpine minirootfs version from latest-releases.yaml on the CDN.
@@ -362,82 +457,31 @@ pub fn resolve_distro_version(
     }?)
 }
 
-/// Build a map of YY.MM version strings to codenames by parsing the Ubuntu
-/// meta-release file (e.g. "24.04" → "noble", "22.04" → "jammy").
-/// Uses the full meta-release (not -lts) so non-LTS versions are also covered.
-fn fetch_ubuntu_version_map() -> anyhow::Result<std::collections::HashMap<String, String>> {
-    let client = crate::download::http_client(Some(Duration::from_secs(30)))?;
-    let text = client
-        .get("https://changelogs.ubuntu.com/meta-release")
-        .send()
-        .context("Failed to fetch Ubuntu meta-release")?
-        .text()
-        .context("Failed to read Ubuntu meta-release")?;
-
-    let mut map = std::collections::HashMap::new();
-    let mut current_dist: Option<String> = None;
-
-    for line in text.lines() {
-        if let Some(dist) = line.strip_prefix("Dist: ") {
-            current_dist = Some(dist.trim().to_string());
-        } else if let Some(version_str) = line.strip_prefix("Version: ") {
-            // Version field may be "22.04", "22.04 LTS", or "24.04.1 LTS".
-            // Normalise to YY.MM by taking the first two dot-separated components.
-            let raw = version_str.split_whitespace().next().unwrap_or("");
-            let normalised: String = {
-                let mut parts = raw.splitn(3, '.');
-                match (parts.next(), parts.next()) {
-                    (Some(a), Some(b)) => format!("{}.{}", a, b),
-                    _ => raw.to_string(),
-                }
-            };
-            if let Some(dist) = &current_dist {
-                map.insert(normalised, dist.clone());
-            }
-        }
-    }
-
-    Ok(map)
-}
-
 fn resolve_ubuntu_version(version: Option<&str>) -> anyhow::Result<String> {
     let version = version.unwrap_or("latest");
     match version {
-        "latest" => fetch_ubuntu_codename("https://changelogs.ubuntu.com/meta-release"),
+        "latest" => fetch_ubuntu_latest_number("https://changelogs.ubuntu.com/meta-release"),
         "lts" | "latest-lts" => {
-            fetch_ubuntu_codename("https://changelogs.ubuntu.com/meta-release-lts")
+            fetch_ubuntu_latest_number("https://changelogs.ubuntu.com/meta-release-lts")
         }
         other => {
-            // If it looks like a YY.MM version number, resolve it to a codename
-            // via the meta-release file so the mapping never goes stale.
             if is_ubuntu_version_number(other) {
-                let map = fetch_ubuntu_version_map()?;
-                map.get(other).cloned().ok_or_else(|| {
-                    anyhow!(
-                        "Unknown Ubuntu version '{}'. \
-                     Use the codename directly (e.g. noble, jammy) or check \
-                     https://changelogs.ubuntu.com/meta-release",
-                        other
-                    )
-                })
+                Ok(normalise_ubuntu_number(other))
             } else {
-                // Treat as a codename and pass through (e.g. "noble", "jammy")
-                Ok(other.to_string())
+                ubuntu_codename_to_number(other)
             }
         }
     }
 }
 
-/// Returns true for strings of the form "YY.MM" (two numeric dot-separated components).
+/// Returns true for strings of the form "YY.MM" or "YY.MM.Z" — every
+/// dot-separated component numeric. Point releases normalise to YY.MM.
 fn is_ubuntu_version_number(s: &str) -> bool {
-    let mut parts = s.splitn(3, '.');
-    matches!(
-        (parts.next(), parts.next(), parts.next()),
-        (Some(a), Some(b), None)
-            if !a.is_empty() && !b.is_empty()
-            && a.chars().all(|c| c.is_ascii_digit())
-            && b.chars().all(|c| c.is_ascii_digit())
-    )
+    let parts: Vec<&str> = s.split('.').collect();
+    (2..=3).contains(&parts.len())
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn resolve_alpine_version(version: Option<&str>, arch: &str) -> anyhow::Result<String> {
@@ -463,11 +507,10 @@ fn resolve_alpine_version(version: Option<&str>, arch: &str) -> anyhow::Result<S
 }
 
 fn resolve_ubuntu_url(version: Option<&str>, arch: &str) -> anyhow::Result<String> {
-    let codename = resolve_ubuntu_version(version)?;
+    let number = resolve_ubuntu_version(version)?;
     let arch = map_arch(Distro::Ubuntu, arch);
     Ok(format!(
-        "https://cdimage.ubuntu.com/ubuntu-base/{}/daily/current/{}-base-{}.tar.gz",
-        codename, codename, arch
+        "https://cdimage.ubuntu.com/ubuntu-base/releases/{number}/release/ubuntu-base-{number}-base-{arch}.tar.gz"
     ))
 }
 
@@ -522,10 +565,12 @@ mod tests {
         assert_eq!(
             checksum_artifact_url(
                 &Distro::Ubuntu,
-                "https://cdimage.ubuntu.com/ubuntu-base/noble/daily/current/noble-base-amd64.tar.gz"
+                "https://cdimage.ubuntu.com/ubuntu-base/releases/26.04/release/ubuntu-base-26.04-base-amd64.tar.gz"
             )
             .as_deref(),
-            Some("https://cdimage.ubuntu.com/ubuntu-base/noble/daily/current/SHA256SUMS")
+            Some(
+                "https://cdimage.ubuntu.com/ubuntu-base/releases/26.04/release/SHA256SUMS"
+            )
         );
     }
 
@@ -699,6 +744,43 @@ mod tests {
         assert_eq!(
             parse("mydir/image"),
             oci("docker.io", "mydir/image", "latest")
+        );
+    }
+    #[test]
+    fn meta_release_parsing_extracts_codename_number_pairs() {
+        let text = "Dist: noble\nVersion: 24.04 LTS\nSupported: 1\n\
+                    Dist: questing\nVersion: 25.10\nSupported: 1\n\
+                    Dist: plucky\nVersion: 25.04\nSupported: 0\n";
+        let releases = parse_ubuntu_meta_release(text);
+        assert_eq!(releases.len(), 3);
+        assert_eq!(releases[0].codename, "noble");
+        assert_eq!(releases[0].number, "24.04");
+        assert!(releases[0].supported);
+        // A point release normalises to YY.MM
+        let text = "Dist: noble\nVersion: 24.04.2 LTS\nSupported: 1\n";
+        assert_eq!(parse_ubuntu_meta_release(text)[0].number, "24.04");
+    }
+
+    #[test]
+    fn ubuntu_numbers_and_codenames_resolve_offline_and_identically() {
+        // The alias promise: number and codename are the same image —
+        // same resolved version, same URL, same cache key. No network.
+        assert_eq!(
+            resolve_ubuntu_version(Some("26.04")).unwrap(),
+            resolve_ubuntu_version(Some("resolute")).unwrap()
+        );
+        assert_eq!(resolve_ubuntu_version(Some("resolute")).unwrap(), "26.04");
+        assert_eq!(resolve_ubuntu_version(Some("NOBLE")).unwrap(), "24.04");
+        // Point releases normalise to the series.
+        assert_eq!(resolve_ubuntu_version(Some("24.04.2")).unwrap(), "24.04");
+        let url = resolve_ubuntu_url(Some("resolute"), "amd64").unwrap();
+        assert_eq!(
+            url,
+            "https://cdimage.ubuntu.com/ubuntu-base/releases/26.04/release/ubuntu-base-26.04-base-amd64.tar.gz"
+        );
+        assert_eq!(
+            resolve_ubuntu_url(Some("26.04"), "amd64").unwrap(),
+            resolve_ubuntu_url(Some("resolute"), "amd64").unwrap()
         );
     }
 }

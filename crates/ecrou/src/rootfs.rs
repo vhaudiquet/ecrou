@@ -624,7 +624,12 @@ fn generate_cache_filename(source: &ImageSource, arch: &str) -> String {
                 Distro::Alpine => "alpine",
             };
             let distro_arch = map_arch(*distro, arch);
-            // Get extension from URL
+            // The extension comes from the URL. `version` is the
+            // resolved value (resolve_source ran first), so this
+            // derivation is offline: numbers and patch-resolved
+            // strings pass through without lookups. A resolution
+            // failure here degrades to the plain .tar.gz name rather
+            // than blocking every cache-path computation.
             let url = resolve_distro_url(distro, version.as_deref(), arch).unwrap_or_default();
             let ext = get_tarball_extension(&url);
             format!(
@@ -723,11 +728,11 @@ mod tests {
 
     #[test]
     fn cache_filename_direct_tarball() {
-        // Explicit codename/version: no network lookups
+        // Explicit version, already resolved to a number: no network lookups
         let cache = RootfsCache::new("/cache");
         assert_eq!(
-            cache.tarball_path(&direct_tarball(Distro::Ubuntu, "noble"), "amd64"),
-            PathBuf::from("/cache/ubuntu-noble-amd64.tar.gz")
+            cache.tarball_path(&direct_tarball(Distro::Ubuntu, "24.04"), "amd64"),
+            PathBuf::from("/cache/ubuntu-24.04-amd64.tar.gz")
         );
         assert_eq!(
             cache.tarball_path(&direct_tarball(Distro::Alpine, "3.23.1"), "amd64"),
