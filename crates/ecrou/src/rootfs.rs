@@ -109,10 +109,7 @@ impl RootfsCache {
                      `ecrou provision --spec <spec> --layer {name}` first"
             ))
         })?;
-        let arch = std::env::consts::ARCH
-            .replace("x86_64", "amd64")
-            .replace("aarch64", "arm64");
-        extract_prepared(&path.clone(), path, arch, progress).map_err(Error::Other)
+        extract_prepared(&path.clone(), path, progress).map_err(Error::Other)
     }
 
     /// The cache path an image resolves to, keyed or not — the same
@@ -188,7 +185,7 @@ impl RootfsCache {
                 )));
             }
             let entry = self.tarball_path(&source, &arch);
-            return extract_prepared(path, entry, arch, progress).map_err(Error::Other);
+            return extract_prepared(path, entry, progress).map_err(Error::Other);
         }
 
         let cache_path = self.tarball_path(&source, &arch);
@@ -251,12 +248,7 @@ impl RootfsCache {
             log::debug!("Using cached tarball: {}", cache_path.display());
         }
 
-        Ok(extract_prepared(
-            &cache_path.clone(),
-            cache_path,
-            arch,
-            progress,
-        )?)
+        Ok(extract_prepared(&cache_path.clone(), cache_path, progress)?)
     }
 
     /// Prepare a provisioned rootfs with cache amortization: when the cache
@@ -287,12 +279,7 @@ impl RootfsCache {
 
         if !req.no_cache && cache_path.exists() && marker.exists() {
             log::debug!("Using provisioned cache entry: {}", cache_path.display());
-            return Ok(extract_prepared(
-                &cache_path.clone(),
-                cache_path,
-                arch,
-                progress,
-            )?);
+            return Ok(extract_prepared(&cache_path.clone(), cache_path, progress)?);
         }
 
         // The miss path prepares the PRISTINE base — a keyed entry
@@ -374,23 +361,12 @@ impl PrepareRequest {
 pub struct PreparedRootfs {
     rootfs: TempDir,
     cache_path: PathBuf,
-    arch: String,
 }
 
 impl PreparedRootfs {
     /// The extracted rootfs directory.
     pub fn dir(&self) -> &Path {
         self.rootfs.path()
-    }
-
-    /// Architecture this rootfs was prepared for.
-    pub fn arch(&self) -> &str {
-        &self.arch
-    }
-
-    /// The cache entry this rootfs was prepared from.
-    pub fn cache_entry(&self) -> &Path {
-        &self.cache_path
     }
 
     /// Persist the current contents of the rootfs into the cache entry it
@@ -441,7 +417,6 @@ fn resolve_source(image: &str, arch: &str) -> anyhow::Result<ImageSource> {
 fn extract_prepared(
     source: &Path,
     cache_path: PathBuf,
-    arch: String,
     progress: &dyn Progress,
 ) -> anyhow::Result<PreparedRootfs> {
     let temp = tempfile::tempdir().context("Failed to create temporary directory")?;
@@ -454,7 +429,6 @@ fn extract_prepared(
     Ok(PreparedRootfs {
         rootfs: temp,
         cache_path,
-        arch,
     })
 }
 
@@ -839,7 +813,6 @@ mod tests {
         let prepared = PreparedRootfs {
             rootfs: rootfs_dir,
             cache_path: cache_path.clone(),
-            arch: "amd64".to_string(),
         };
         prepared.persist().unwrap();
 
