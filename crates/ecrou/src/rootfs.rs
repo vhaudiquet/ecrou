@@ -46,6 +46,110 @@ use crate::registry::fetch_oci_digest;
 /// Sidecar suffix marking a cache entry that holds a provisioned rootfs.
 const PROVISIONED_SUFFIX: &str = "provisioned";
 
+/// Download `source` into the cache at `cache_path`, and drop any
+/// provisioned marker: whatever was provisioned belonged to the entry
+/// this download replaces, and a stale marker would present the
+/// pristine image as provisioned and skip the next provisioning for
+/// good.
+fn fill_entry(
+    source: &ImageSource,
+    cache_path: &Path,
+    arch: &str,
+    progress: &dyn Progress,
+) -> Result<()> {
+    download_image(source, cache_path, arch, progress)?;
+    let marker = sidecar(cache_path, PROVISIONED_SUFFIX);
+    if marker.exists() {
+        std::fs::remove_file(&marker).with_context(|| {
+            format!(
+                "Failed to drop the stale provisioned marker {}",
+                marker.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Whether an OCI image with a floating tag (":latest") has moved since
+/// it was cached: fetch the current manifest digest from the registry
+/// and compare it against the digest stored from the last download.
+/// Pinned tags are assumed immutable; a network error keeps the cache
+/// rather than hard-failing; anything else is simply current.
+fn oci_freshness_changed(source: &ImageSource, cache_path: &Path) -> bool {
+    if !cache_path.exists() {
+        return false; // cache absent — the missing-file check triggers the download
+    }
+    let ImageSource::OciImage {
+        registry,
+        repository,
+        tag,
+        ..
+    } = source
+    else {
+        return false;
+    };
+    if tag != "latest" {
+        return false;
+    }
+    match fetch_oci_digest(registry, repository, tag) {
+        Ok(current) => {
+            let stored = std::fs::read_to_string(digest_sidecar(cache_path)).ok();
+            stored.as_deref() != Some(current.trim())
+        }
+        Err(e) => {
+            log::warn!("could not check image freshness ({}); using cache", e);
+            false
+        }
+    }
+}
+
+/// An exclusive advisory lock on one cache entry, held while a run
+/// downloads it: a second run preparing the same image blocks here and
+/// then reuses the winner's entry instead of downloading a duplicate
+/// the atomic rename would throw away. The lock file is a permanent
+/// zero-byte sidecar; flock releases when the holder exits, crashed or
+/// not.
+struct EntryLock {
+    _file: std::fs::File,
+}
+
+impl EntryLock {
+    /// Block until the entry is free. `no_cache` callers skip the
+    /// lock entirely: an explicit fresh download never waits.
+    fn acquire(entry: &Path) -> anyhow::Result<Self> {
+        use std::os::fd::AsRawFd;
+
+        let lock_path = entry.with_extension("lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&lock_path)
+            .with_context(|| format!("Failed to open the entry lock {}", lock_path.display()))?;
+
+        let held = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if held != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(
+                    anyhow::Error::from(err).context(format!("locking {}", lock_path.display()))
+                );
+            }
+            log::warn!(
+                "waiting for another ecrou run to finish preparing {}",
+                entry.display()
+            );
+            let held = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if held != 0 {
+                return Err(anyhow::Error::from(std::io::Error::last_os_error())
+                    .context(format!("locking {}", lock_path.display())));
+            }
+        }
+        Ok(EntryLock { _file: file })
+    }
+}
+
 /// A layer name is a file name under the cache's `layers/` directory
 /// and a component of entry file names: keep it to a safe charset so a
 /// name like `../x` or `a/b` cannot climb out of the cache directory.
@@ -220,54 +324,35 @@ impl RootfsCache {
         // against the digest stored from the last download.  Only re-pull when
         // the digest has actually changed.  On a network error we fall back to
         // the cached image with a warning rather than hard-failing.
-        let oci_digest_changed = if cache_path.exists() {
-            if let ImageSource::OciImage {
-                registry,
-                repository,
-                tag,
-                ..
-            } = &source
-            {
-                if tag == "latest" {
-                    match fetch_oci_digest(registry, repository, tag) {
-                        Ok(current) => {
-                            let stored = std::fs::read_to_string(digest_sidecar(&cache_path)).ok();
-                            stored.as_deref() != Some(current.trim())
-                        }
-                        Err(e) => {
-                            log::warn!("could not check image freshness ({}); using cache", e);
-                            false
-                        }
-                    }
-                } else {
-                    false // pinned tags are assumed immutable
-                }
-            } else {
-                false
-            }
-        } else {
-            false // cache absent — download triggered by !cache_path.exists() below
-        };
+        let oci_digest_changed = oci_freshness_changed(&source, &cache_path);
 
         // Download when not cached, explicitly requested, or the remote digest
         // has moved
-        if req.no_cache || !cache_path.exists() || oci_digest_changed {
+        let needs_download = req.no_cache || !cache_path.exists() || oci_digest_changed;
+        if needs_download {
             std::fs::create_dir_all(&self.dir).with_context(|| {
                 format!("Failed to create cache directory {}", self.dir.display())
             })?;
-            download_image(&source, &cache_path, &arch, progress)?;
-            // Whatever was provisioned belonged to the entry this just
-            // replaced. A stale marker here would present the pristine
-            // image as provisioned and skip the next provisioning for
-            // good.
-            let marker = sidecar(&cache_path, PROVISIONED_SUFFIX);
-            if marker.exists() {
-                std::fs::remove_file(&marker).with_context(|| {
-                    format!(
-                        "Failed to drop the stale provisioned marker {}",
-                        marker.display()
-                    )
-                })?;
+            if req.no_cache {
+                fill_entry(&source, &cache_path, &arch, progress)?;
+            } else {
+                // One writer per entry: a concurrent run preparing the
+                // same image waits here instead of downloading a second
+                // copy the atomic rename would throw away.
+                let _entry_lock = EntryLock::acquire(&cache_path).map_err(Error::Other)?;
+                // Re-derive the freshness answer under the lock: a
+                // competing run may have filled or refreshed the entry
+                // while we waited.
+                let stale = !cache_path.exists()
+                    || (oci_digest_changed && oci_freshness_changed(&source, &cache_path));
+                if stale {
+                    fill_entry(&source, &cache_path, &arch, progress)?;
+                } else {
+                    log::debug!(
+                        "another run prepared {} while we waited; using it",
+                        cache_path.display()
+                    );
+                }
             }
         } else {
             log::debug!("Using cached tarball: {}", cache_path.display());
