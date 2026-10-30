@@ -73,13 +73,6 @@ pub(crate) fn spawn_machine(
                 .context("forking the machine process"),
         ));
     }
-
-    if child < 0 {
-        return Err(Error::Other(
-            anyhow::Error::from(std::io::Error::last_os_error())
-                .context("forking the machine process"),
-        ));
-    }
     Ok(child)
 }
 
@@ -189,6 +182,28 @@ pub(crate) fn stream_console(
     Ok(())
 }
 
+/// Kill the machine and collect it. Any parent-side failure after the
+/// fork must land here: a library caller keeps running after a run
+/// error, and the kill contract (PDEATHSIG) only fires when their
+/// process exits. Best effort by construction — a machine that already
+/// exited reaps through ECHILD and the call is a no-op.
+pub(crate) fn kill_machine(child: libc::pid_t) {
+    // Safety: the pid is our own child; SIGKILL is uncatchable and has
+    // no handler side effects to mind.
+    unsafe { libc::kill(child, libc::SIGKILL) };
+    let mut status: libc::c_int = 0;
+    // Safety: waitpid on our own child; the pointer targets valid
+    // storage.
+    loop {
+        let r = unsafe { libc::waitpid(child, &mut status, 0) };
+        // EINTR: interrupted, not ended — collect again.
+        if r == -1 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break;
+    }
+}
+
 /// Collect the machine: its exit status is the payload's exit code (the
 /// guest init blob reports it and the VMM exits the child with it).
 pub(crate) fn wait_machine(
@@ -284,7 +299,11 @@ mod tests {
     #[test]
     fn a_signaled_machine_is_an_engine_failure() {
         let dir = tempfile::tempdir().unwrap();
-        for raw in [signaled(libc::SIGSEGV), signaled(libc::SIGKILL), signaled(libc::SIGTERM)] {
+        for raw in [
+            signaled(libc::SIGSEGV),
+            signaled(libc::SIGKILL),
+            signaled(libc::SIGTERM),
+        ] {
             let err = decode_status(raw, &dir.path().join("absent")).unwrap_err();
             assert!(
                 err.to_string().contains("engine or hypervisor failure"),
@@ -327,5 +346,27 @@ mod tests {
         let exit_file = dir.path().join(".ecrou-exit");
         std::fs::write(&exit_file, "not a number").unwrap();
         assert_eq!(decode_status(exited(42), &exit_file).unwrap(), 42);
+    }
+
+    #[test]
+    fn kill_machine_reaps_a_living_child() {
+        // Safety: the child body only pauses and _exits; nothing
+        // allocates after the fork.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            loop {
+                unsafe { libc::pause() };
+            }
+        }
+        kill_machine(child);
+        // The child is reaped: waitpid has nothing left to report.
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+        assert_eq!(r, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 }

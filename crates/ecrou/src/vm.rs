@@ -286,9 +286,18 @@ pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32
         )
     } else {
         let reaped = std::sync::atomic::AtomicI32::new(-1);
-        crate::supervise::stream_console(&console_path, child, &reaped)?;
-        crate::supervise::wait_machine(child, &reaped, &exit_file_host)
+        crate::supervise::stream_console(&console_path, child, &reaped)
+            .and_then(|()| crate::supervise::wait_machine(child, &reaped, &exit_file_host))
     };
+    // A parent-side failure (a console stat or read that went wrong, a
+    // wait that could not complete) must not leave the machine booting
+    // unattended: a library caller keeps running after a run error,
+    // and the kill contract only reaches through their process exit.
+    // On a run that failed after the child already exited this is a
+    // no-op reaping.
+    if result.is_err() {
+        crate::supervise::kill_machine(child);
+    }
     tty_restore.restore();
     result
 }
