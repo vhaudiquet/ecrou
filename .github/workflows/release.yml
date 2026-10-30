@@ -27,10 +27,21 @@ jobs:
             echo "release=false" >> "$GITHUB_OUTPUT"
           fi
 
-  publish-snap:
+  build-snap:
     needs: gate
     if: needs.gate.outputs.release == 'true'
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: snap-amd64
+          # GitHub's free arm64 runners build the arm64 snap natively:
+          # libkrun compiles there, and the libkrunfw part picks the
+          # arm64 pool .deb through CRAFT_ARCH_BUILD_FOR.
+          - os: ubuntu-24.04-arm
+            artifact: snap-arm64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -44,11 +55,38 @@ jobs:
       - uses: snapcore/action-build@v1
         id: build
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ steps.build.outputs.snap }}
+
+  publish-snap:
+    needs: build-snap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: snap-*
+          path: snaps
+
+      - name: Resolve the snap paths
+        id: paths
+        run: |
+          echo "amd64=$(ls snaps/snap-amd64/*.snap)" >> "$GITHUB_OUTPUT"
+          echo "arm64=$(ls snaps/snap-arm64/*.snap)" >> "$GITHUB_OUTPUT"
+
       # Requires the SNAP_STORE_LOGIN secret: the output of
       #   snapcraft export-login --snaps ecrou --channels stable -
       - uses: snapcore/action-publish@v1
         env:
           SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAP_STORE_LOGIN }}
         with:
-          snap: ${{ steps.build.outputs.snap }}
+          snap: ${{ steps.paths.outputs.amd64 }}
+          release: stable
+
+      - uses: snapcore/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAP_STORE_LOGIN }}
+        with:
+          snap: ${{ steps.paths.outputs.arm64 }}
           release: stable
