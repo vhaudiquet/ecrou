@@ -66,8 +66,10 @@ Everything the host process may do, and nothing else:
 
 - fs: read, write, stat, rename, unlink, mkdir, fallocate under the
   cache directory and the share roots it was given, plus the scratch
-  rootfs TempDir
-- exec: itself; libraries via `dlopen` (`libkrun.so.1`, libkrunfw)
+  directory holding the run's image copy
+- exec: itself; libraries via `dlopen` (`libkrun.so.1`, libkrunfw);
+  e2fsprogs helpers (`mkfs.ext4`, `debugfs`) as child processes, and
+  `cp` for the per-run image copy
 - `/dev/kvm`: open, ioctl, mmap
 - net: TCP and UDP client sockets; with TSI these carry the guest's
   connections too, proxied host-side
@@ -93,9 +95,13 @@ are the shape. A guest agent and long-lived machines are a Later row.
 
 Ephemeral rootfs, durable workspace. The base system is a scratch copy
 of the image; it exists only for the run and dies with it. Persistence
-crosses a share or it does not happen. No initramfs and no cpio
-builder: the rootfs crosses as a virtiofs share, never as a packed
-archive.
+crosses a share or it does not happen. The rootfs crosses as a raw
+ext4 image: mke2fs builds a cache image straight from the image
+tarball, the run copies it into a scratch directory, and the engine
+attaches it as a virtio-blk disk the init blob mounts at `/`. No
+initramfs and no cpio builder, and no extraction to a host tree —
+an unprivileged extract cannot preserve a tar's owners, and the
+tarball-to-image pipeline never needs one.
 
 **Workspace shares.** `-v HOST:GUEST[:ro]`, one virtiofs share per
 entry. The host side is plain fs; the guest init mounts each share at
@@ -103,13 +109,18 @@ its guest path. There is no implicit share: an empty machine is the
 default, and the consumer chooses what crosses — a sandbox runtime
 does not silently attach the caller's cwd.
 
-Ownership needs no mapping layer. The guest runs as root inside its
-own kernel, and libkrun's simplified virtiofs semantics report the
-requesting guest uid for ownership while storing permission bits
-host-side; writes through a share land owned by the host user.
+Ownership is real inside the machine. The image bakes the ownership
+the archive records — mke2fs reads uid and gid from the tarball — and
+the guest runs as root on a real filesystem, so `chown` inside the
+machine works, including recursive ones that a virtiofs share owned by
+the host user refuses with EPERM. Shares remain the honest exception:
+the host side belongs to the host user, so writes through a share land
+owned by the host user and a guest chown there fails exactly as it
+would on the host.
 
-**The guest init.** A small script provisioned into the scratch rootfs
-for every run: it mounts each share, cds to the workdir, runs the
+**The guest init.** A small script written into the image copy
+through debugfs for every run: it mounts each share, cds to the
+workdir, runs the
 payload, and writes the exit code to the control file. It never execs
 — the init must outlive the payload to report it — and has no
 share-less special case: the same contract covers a bare shell run.
@@ -119,18 +130,20 @@ runs through the image's shell as `sh -c`. Ending the machine is not
 the script's job: when it exits, the init blob reports the code and
 the VMM powers the machine off.
 
-**Exit codes.** Only the guest init can mint a guest exit code: it
-reports the payload's code through the control file and the VMM exits
-the machine child with it. A signal on the machine child means the VMM
-or the engine died — the payload never reported — and `run` fails with
+**Exit codes.** Only the guest init can mint a guest exit code, and
+the control file is how: the init writes the payload's code before it
+exits, and the run reads it back out of the image after the machine
+dies. The file outranks the machine child's own exit code — with a
+block root the engine's exit-code channel (an ioctl through the
+virtiofs root device) never fires, so the child's code is machinery
+talk, not a report. A signal on the machine child means the VMM or the
+engine died — the payload never reported — and `run` fails with
 an engine-failure error, never a 128+signal guess at a guest code.
 125 and 126 are reserved by the machinery itself: the child bails
 with 125 on a boot failure and the init refuses with 126 when a share
 would not mount or the workdir is missing. Ending on either without a
-control-file code is an error naming the cause; a payload that
-genuinely exits either code reported through the file first, and the
-file is the arbiter. The control file remains the boot diagnostic in
-every other death.
+control-file code is an error naming the cause. The control file
+remains the boot diagnostic in every other death.
 
 **Cancellation is a kill.** The VMM lives in a child of the ecrou
 process carrying PR_SET_PDEATHSIG, so a killed consumer kills the
@@ -241,9 +254,10 @@ stop:
 - **T4, kill chain.** SIGKILL ecrou-cli mid-run; the VM is gone with
   the process, no stray threads or KVM VMs, verified by scanning the
   process table and `/dev/kvm` users.
-- **T5, boot economics.** Alpine, cache-warm: extract plus boot lands
-  under 1.5 s to first guest output. Larger images report their numbers
-  unblocked; the shared-ro-rootfs row in Later is the fix if they hurt.
+- **T5, boot economics.** Alpine, cache-warm: image copy plus boot
+  lands under 1.5 s to first guest output. Larger images report their
+  numbers unblocked; the shared-ro-rootfs row in Later is the fix if
+  they hurt.
 - **T6, no-mount audit.** `strace -f -e trace=mount,umount2,unshare,
   setns,pivot_root,open_tree,move_mount,fsopen,fsmount` over a full run
   with shares: zero hits. This test is the founding rule.
@@ -256,7 +270,9 @@ Confinement: strict. Plugs: `network`, `home`, `kvm`. The manual
 `snap connect` for kvm is accepted until auto-connect is a store
 request and a later product decision.
 
-The snap stages `libkrun.so.1` and libkrunfw next to the binary; the
+The snap stages `libkrun.so.1` (built with the `blk` feature: the
+virtio-blk device is what carries the rootfs) and libkrunfw next to
+the binary, plus e2fsprogs for `mkfs.ext4` and `debugfs`; the
 kernel ships inside libkrunfw, so there is nothing else to fetch or
 stage. No Ubuntu release publishes a `libkrun.so.1` package today, and
 libkrunfw5 exists only in the current development series' universe,
@@ -274,9 +290,9 @@ build is deleted.
 
 - **QEMU engine.** The TCG fallback for machines without KVM. The
   `RunOptions` API does not change; the engine choice is the probe's.
-- **Shared read-only rootfs.** Serve the cache rootfs directly, ro,
-  with a guest-side overlay for writes: no extraction per run. The
-  correct-and-slow v1 posture graduates into this.
+- **Shared read-only rootfs.** Serve the cache image directly, ro,
+  with a guest-side overlay for writes: no copy per run. The
+  copy-and-throw-away v1 posture graduates into this.
 - **Guest agent, long-lived machines.** Exec without a boot; the shape
   to grow into when per-command VMs stop being right.
 - **A build story for hosts that cannot build.** Provision was cut
