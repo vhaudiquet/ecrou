@@ -359,8 +359,7 @@ fn fetch_ubuntu_meta_releases(url: &str) -> anyhow::Result<Vec<UbuntuRelease>> {
 fn fetch_ubuntu_latest_number(url: &str) -> anyhow::Result<String> {
     fetch_ubuntu_meta_releases(url)?
         .into_iter()
-        .filter(|r| r.supported)
-        .next_back()
+        .rfind(|r| r.supported)
         .map(|r| r.number)
         .ok_or_else(|| anyhow!("no supported Ubuntu release listed in {}", url))
 }
