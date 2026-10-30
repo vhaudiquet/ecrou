@@ -48,10 +48,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install strace
+      - name: Install strace and the image tooling
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq strace
+          # mke2fs populates from a tarball through a runtime dlopen of
+          # libarchive; the runner has e2fsprogs but not the lib.
+          sudo apt-get install -y -qq strace libarchive13t64 \
+            || sudo apt-get install -y -qq strace libarchive13
 
       # The runner exposes nested KVM; the runner user needs rw on the
       # device node for the probe to pass.
