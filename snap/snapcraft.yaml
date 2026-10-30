@@ -1,6 +1,7 @@
 name: ecrou
 base: core26
 version: "0.1.0"
+title: ecrou
 summary: The strictly confined microVM runtime
 description: |
   ecrou boots disposable Linux environments as one-shot microVMs on
@@ -31,6 +32,10 @@ description: |
   The home interface does not cover dotfiles, so the XDG
   directories are redirected into the snap's common data area.
 license: MIT
+website: https://github.com/vhaudiquet/ecrou
+contact: https://github.com/vhaudiquet/ecrou/issues
+issues: https://github.com/vhaudiquet/ecrou/issues
+source-code: https://github.com/vhaudiquet/ecrou
 grade: stable
 confinement: strict
 
