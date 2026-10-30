@@ -37,6 +37,7 @@ confinement: strict
 platforms:
   amd64:
   arm64:
+  riscv64:
 
 apps:
   ecrou:
@@ -86,21 +87,27 @@ parts:
   libkrunfw:
     plugin: nil
     # libkrunfw5 ships only in stonking universe today, not in any LTS
-    # base, so the .deb comes straight from the pool — one flavor per
-    # target arch. The library embeds its kernel and has no external
-    # symbols, so it runs on the base's older glibc. The pool carries
-    # no riscv64 build, and libkrun does not target riscv64, so the
-    # snap builds for amd64 and arm64 only.
+    # base, so the .deb comes straight from the Ubuntu archive — one
+    # flavor per target arch. riscv64 lives on the ports archive
+    # (archive.ubuntu.com carries amd64 and arm64 binaries only). The
+    # library embeds its kernel and has no external symbols, so it
+    # runs on the base's older glibc.
     build-packages: [curl]
     override-pull: |
       arch="$CRAFT_ARCH_BUILD_FOR"
       case "$arch" in
-        amd64) digest="924cd545080aaf5da66740d12a51b7a5cbd9a5c0b502d21cbef9bc82bf1c8b6b" ;;
-        arm64) digest="9570e82feac79fd41a6a9674cc02a9b2f09948ac30ad480d05fc73a957843e56" ;;
-        *) echo "no libkrunfw5 build for $arch in the Ubuntu pool" >&2; exit 1 ;;
+        amd64)
+          digest="924cd545080aaf5da66740d12a51b7a5cbd9a5c0b502d21cbef9bc82bf1c8b6b"
+          pool="https://archive.ubuntu.com/ubuntu/pool/universe/libk/libkrunfw" ;;
+        arm64)
+          digest="9570e82feac79fd41a6a9674cc02a9b2f09948ac30ad480d05fc73a957843e56"
+          pool="https://archive.ubuntu.com/ubuntu/pool/universe/libk/libkrunfw" ;;
+        riscv64)
+          digest="1f8b52a00eafdf52d2295eeab7dd527736788ce4d3aa97aecc18e3f4b66f413f"
+          pool="https://ports.ubuntu.com/ubuntu-ports/pool/universe/libk/libkrunfw" ;;
+        *) echo "no libkrunfw5 .deb mapped for $arch" >&2; exit 1 ;;
       esac
-      curl -fL -o libkrunfw5.deb \
-        "https://archive.ubuntu.com/ubuntu/pool/universe/libk/libkrunfw/libkrunfw5_5.5.0+ds-1_${arch}.deb"
+      curl -fL -o libkrunfw5.deb "$pool/libkrunfw5_5.5.0+ds-1_${arch}.deb"
       echo "$digest  libkrunfw5.deb" | sha256sum -c
     override-build: |
       dpkg -x libkrunfw5.deb unpack
