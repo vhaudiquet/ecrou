@@ -1,6 +1,9 @@
 name: ecrou
 base: core26
-version: "0.1.0"
+# The version is adopted from the workspace Cargo.toml at pull time —
+# the same value the binary reports with --version. One number, one
+# place to bump.
+adopt-info: ecrou
 title: ecrou
 summary: The strictly confined microVM runtime
 description: |
@@ -60,6 +63,13 @@ parts:
     rust-channel: "1.98.1"
     rust-path: [crates/ecrou-cli]
     build-packages: [cmake, perl]
+    override-pull: |
+      craftctl default
+      # [workspace.package] version — the single `version = "..."` at
+      # the head of the workspace manifest. A missed match fails the
+      # pack loudly instead of packing a versionless snap.
+      craftctl set version="$(sed -n 's/^version = "\(.*\)"/\1/p' \
+        "$CRAFT_PART_SRC/Cargo.toml")"
     override-build: |
       craftctl default
       # The home interface stops at dotfiles, so ~/.cache is

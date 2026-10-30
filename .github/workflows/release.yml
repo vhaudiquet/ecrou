@@ -51,8 +51,8 @@ jobs:
         run: |
           v="${GITHUB_REF_NAME#v}"
           sed -i "s/^version = \".*\"/version = \"$v\"/" Cargo.toml
-          sed -i "s/^version: \".*\"/version: \"$v\"/" snap/snapcraft.yaml
-          grep -H '^version' Cargo.toml snap/snapcraft.yaml
+          # The snap adopts this version from Cargo.toml at pull time.
+          grep -H '^version' Cargo.toml
 
       - uses: snapcore/action-build@v1
         id: build
