@@ -13,6 +13,25 @@
 //! exactly that, so the type a consumer matches on survives every `?`
 //! between the producer and the public API.
 
+/// The KVM module hint, per compile target: the module layout differs
+/// across architectures, and the snap ships arm64 and riscv64 next to
+/// amd64. (x86_64 splits KVM per vendor; everywhere else it is one
+/// module.)
+#[cfg(target_arch = "x86_64")]
+const KVM_MODULE_HINT: &str = "sudo modprobe kvm_intel  (or kvm_amd on AMD)";
+#[cfg(not(target_arch = "x86_64"))]
+const KVM_MODULE_HINT: &str = "sudo modprobe kvm";
+
+/// The nested-virtualization hint: a VM inside a VM needs nested virt
+/// enabled on the outer hypervisor, and on x86_64 that is also where
+/// the parameter file lives. Other architectures have nothing
+/// actionable to check.
+#[cfg(target_arch = "x86_64")]
+const KVM_NESTED_HINT: &str =
+    "enable it on the hypervisor, then cat /sys/module/kvm_intel/parameters/nested";
+#[cfg(not(target_arch = "x86_64"))]
+const KVM_NESTED_HINT: &str = "only actionable on x86_64 hosts";
+
 /// Errors returned by the ecrou library API.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -24,9 +43,8 @@ pub enum Error {
         "KVM is not available\n\n\
          ecrou boots microVMs and needs /dev/kvm:\n\
          \x20 check the module:   lsmod | grep kvm\n\
-         \x20 load it:            sudo modprobe kvm_intel  (or kvm_amd)\n\
-         \x20 nested virt (in a VM): enable it on the hypervisor, then\n\
-         \x20                     cat /sys/module/kvm_intel/parameters/nested\n\
+         \x20 load it:            {KVM_MODULE_HINT}\n\
+         \x20 nested virt (in a VM): {KVM_NESTED_HINT}\n\
          \x20 access:             sudo usermod -aG kvm $USER  (re-login)"
     )]
     KvmUnavailable(#[source] std::io::Error),
@@ -65,7 +83,7 @@ mod tests {
         let msg =
             Error::KvmUnavailable(std::io::Error::from_raw_os_error(libc::EACCES)).to_string();
         assert!(msg.contains("KVM is not available"));
-        assert!(msg.contains("modprobe kvm_intel"));
+        assert!(msg.contains("modprobe kvm"));
         assert!(msg.contains("usermod -aG kvm"));
         // The open(2) detail stays reachable for {err:#} printing,
         // which the CLI does over an anyhow wrapping of this error.
