@@ -136,7 +136,7 @@ jobs:
       - name: Smoke — boot alpine under confinement
         run: |
           set -euo pipefail
-          guest="$(timeout 10m ecrou run -q alpine -- uname -r | tail -n 1)"
+          guest="$(timeout 10m ecrou run --quiet alpine -- uname -r | tail -n 1)"
           host="$(uname -r)"
           echo "guest kernel: $guest / host kernel: $host"
           test -n "$guest" && test "$guest" != "$host"
@@ -151,6 +151,6 @@ jobs:
       - name: apt update && install fastfetch
         run: |
           set -euo pipefail
-          timeout 35m ecrou run -q -e DEBIAN_FRONTEND=noninteractive ubuntu -- \
+          timeout 35m ecrou run --quiet -e DEBIAN_FRONTEND=noninteractive ubuntu -- \
             "apt update && apt install -y fastfetch && fastfetch" | tee /tmp/e2e.log
           grep -E "^OS:" /tmp/e2e.log

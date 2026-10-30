@@ -269,7 +269,7 @@ stop:
   with shares: zero hits. This test is the founding rule.
 - **T7, guest network.** An https fetch from the guest succeeds, DNS
   included; a published port is reachable from the host.
-- **T8, snap e2e.** CI builds the snap and runs `ecrou run -q -e
+- **T8, snap e2e.** CI builds the snap and runs `ecrou run --quiet -e
   DEBIAN_FRONTEND=noninteractive ubuntu -- "apt update && apt install
   -y fastfetch && fastfetch"` inside it: strict confinement, KVM
   through the plug, the staged e2fsprogs, apt across the TSI proxy,
