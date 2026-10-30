@@ -38,7 +38,9 @@ jobs:
             artifact: snap-amd64
           # GitHub's free arm64 runners build the arm64 snap natively:
           # libkrun compiles there, and the libkrunfw part picks the
-          # arm64 pool .deb through CRAFT_ARCH_BUILD_FOR.
+          # arm64 pool .deb through CRAFT_ARCH_BUILD_FOR. riscv64 is a
+          # declared platform but has no hosted runner: build and
+          # publish that snap by hand (snapcraft remote-build).
           - os: ubuntu-24.04-arm
             artifact: snap-arm64
     runs-on: ${{ matrix.os }}
