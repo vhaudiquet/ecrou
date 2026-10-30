@@ -102,6 +102,14 @@ impl Default for RunOptions {
 }
 
 /// Run one machine to completion and return the payload's exit code.
+///
+/// The machine is a forked child of this process, and the child never
+/// execs: it configures libkrun in the same process image and enters
+/// the VMM there. ecrou's own work (downloads, image builds) is done
+/// before the fork; a consumer running other threads alongside `run`
+/// should know the fork lands in their thread state, and a thread
+/// holding the allocator or dynamic-loader lock at that instant can
+/// deadlock the machine child.
 pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32> {
     let mut request = PrepareRequest::new(options.image.clone());
     request.arch = options.arch.clone();
@@ -114,7 +122,9 @@ pub fn run(options: &RunOptions, progress: &dyn Progress) -> Result<i32> {
 }
 
 /// Boot one machine over an already-prepared rootfs. This is the
-/// boot half of [`run`]: prepare lands the tree, this boots it.
+/// boot half of [`run`]: prepare lands the tree, this boots it. The
+/// machine is a forked child that never execs; see [`run`] for the
+/// threading constraint that carries.
 pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32> {
     if options.image.is_empty() {
         return Err(Error::Other(anyhow!("no image given")));
