@@ -50,5 +50,5 @@ pub mod vm;
 pub use cache::RootfsCache;
 pub use error::{Error, Result};
 pub use progress::{NoProgress, Progress, Unit};
-pub use rootfs::{PrepareRequest, PreparedRootfs};
+pub use rootfs::{PrepareRequest, PreparedRootfs, Pulled};
 pub use vm::{run, LogLevel, RunOptions, Share};
