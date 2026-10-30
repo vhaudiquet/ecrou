@@ -37,3 +37,50 @@ jobs:
 
       - name: cargo test
         run: cargo test
+
+  t6:
+    name: T6 strace audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install strace
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq strace
+
+      # The runner exposes nested KVM; the runner user needs rw on the
+      # device node for the probe to pass.
+      - name: Open /dev/kvm
+        run: |
+          test -c /dev/kvm || { echo "::error::no /dev/kvm on this runner"; exit 1; }
+          test -w /dev/kvm || sudo chmod 666 /dev/kvm
+
+      # The engine is dlopen'd at runtime: build libkrun from the same
+      # tag the snap bundles, and take libkrunfw from the pool the way
+      # the snap's libkrunfw part does.
+      - name: Build the engine
+        run: |
+          curl -fsSL -o /tmp/libkrunfw5.deb \
+            https://archive.ubuntu.com/ubuntu/pool/universe/libk/libkrunfw/libkrunfw5_5.5.0+ds-1_amd64.deb
+          echo "924cd545080aaf5da66740d12a51b7a5cbd9a5c0b502d21cbef9bc82bf1c8b6b  /tmp/libkrunfw5.deb" | sha256sum -c
+          dpkg -x /tmp/libkrunfw5.deb /tmp/libkrunfw
+          git clone --depth 1 --branch v1.19.7 https://github.com/containers/libkrun /tmp/libkrun
+          cargo build --release --manifest-path /tmp/libkrun/Cargo.toml -p libkrun --features net
+          mkdir /tmp/engine
+          cp /tmp/libkrun/target/release/libkrun.so /tmp/engine/libkrun.so.1
+          cp /tmp/libkrunfw/usr/lib/x86_64-linux-gnu/libkrunfw.so.5.5.0 /tmp/engine/
+          ln -s libkrunfw.so.5.5.0 /tmp/engine/libkrunfw.so.5
+
+      - name: Build the CLI
+        run: cargo build --release -p ecrou-cli
+
+      - name: T6 — no denied syscalls in the host process tree
+        env:
+          ECROU_BIN: ${{ github.workspace }}/target/release/ecrou
+          LD_LIBRARY_PATH: /tmp/engine
+        run: cargo test -p ecrou-cli -- --ignored
