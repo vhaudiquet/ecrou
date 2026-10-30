@@ -47,24 +47,6 @@ impl Distro {
     }
 }
 
-/// Parse an image reference and resolve floating version aliases ("latest",
-/// "lts", "edge", …) to a concrete version, so the cache key is stable
-/// (e.g. "ubuntu-noble-amd64", not "ubuntu-latest-amd64") and a future
-/// release automatically gets its own cache entry.
-pub(crate) fn resolve_source(image: &str, arch: &str) -> anyhow::Result<ImageSource> {
-    let source = parse_image_ref(image, arch)?;
-    match source {
-        ImageSource::DirectTarball { distro, version } => {
-            let resolved = resolve_distro_version(&distro, version.as_deref(), arch)?;
-            Ok(ImageSource::DirectTarball {
-                distro,
-                version: Some(resolved),
-            })
-        }
-        other => Ok(other),
-    }
-}
-
 /// Parse image reference and return the appropriate source
 /// Supports:
 /// - Simple distro names: ubuntu, debian, alpine
@@ -458,6 +440,32 @@ fn fetch_alpine_latest_version(arch: &str) -> anyhow::Result<String> {
 /// patch release by querying the CDN branch `v{minor}`.
 fn fetch_alpine_minor_version(minor: &str, arch: &str) -> anyhow::Result<String> {
     fetch_alpine_version_from_branch(&format!("v{}", minor), arch)
+}
+
+/// The version a reference resolves to without touching the network,
+/// when it names one entry exactly: an Ubuntu YY.MM number, a codename
+/// this build's table knows, or a full Alpine X.Y.Z. Floating
+/// references — "latest", "lts", "edge", an Alpine "X.Y" series —
+/// return None and need the network or the cache to answer.
+pub(crate) fn offline_resolved_version(distro: &Distro, version: Option<&str>) -> Option<String> {
+    let v = version.unwrap_or("latest");
+    match distro {
+        Distro::Ubuntu => {
+            if is_ubuntu_version_number(v) {
+                Some(normalise_ubuntu_number(v))
+            } else {
+                UBUNTU_CODENAMES
+                    .iter()
+                    .find(|(name, _)| *name == v.to_lowercase())
+                    .map(|(_, number)| number.to_string())
+            }
+        }
+        Distro::Alpine => {
+            // "3.23.1" is one tarball; "3.23" floats to the current
+            // patch release, and "latest"/"edge" float entirely.
+            (v.matches('.').count() == 2).then(|| v.to_string())
+        }
+    }
 }
 
 /// Resolve the canonical version string for a distro, performing a network lookup

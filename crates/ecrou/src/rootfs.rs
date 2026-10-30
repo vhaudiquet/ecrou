@@ -9,8 +9,10 @@
 //! will, which a virtiofs share owned by the host user never allowed.
 //!
 //! The run path is [`RootfsCache::prepare`]: a present cache entry is
-//! trusted as-is — the registry is never contacted — and the freshness
-//! decision belongs to [`RootfsCache::pull`]:
+//! trusted as-is — the registry and the distro CDNs are never
+//! contacted on a hit; a floating alias boots the newest cached entry
+//! for the distro — and the freshness decision belongs to
+//! [`RootfsCache::pull`]:
 //!
 //! ```no_run
 //! use ecrou::{NoProgress, PrepareRequest, RootfsCache};
@@ -28,7 +30,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context};
 
 use crate::cache::{oci_freshness_changed, EntryLock, RootfsCache};
-use crate::distro::{resolve_source, ImageSource};
+use crate::distro::{
+    map_arch, offline_resolved_version, parse_image_ref, resolve_distro_version, Distro,
+    ImageSource,
+};
 use crate::download::download_image;
 use crate::error::Error;
 use crate::progress::Progress;
@@ -45,6 +50,123 @@ pub struct Pulled {
     pub downloaded: bool,
 }
 
+/// Resolution with the cache in the loop. A reference that names one
+/// entry exactly — an Ubuntu YY.MM number or known codename, a full
+/// Alpine X.Y.Z — resolves offline on every path. A floating
+/// reference ("latest", "lts", "edge", an Alpine "X.Y" series) needs
+/// the network or the cache to answer: `pull` and `--no-cache`
+/// resolve upstream, because freshness is the point, while
+/// `prepare`/`run` boot the newest cached entry for the distro and
+/// resolve only when nothing cached matches — `docker run` uses the
+/// local image, and a stale alias boots until someone pulls.
+fn resolve_for_request(
+    req: &PrepareRequest,
+    cache_dir: &Path,
+    recheck: bool,
+) -> Result<ImageSource> {
+    let arch = req.resolved_arch();
+    let parsed = parse_image_ref(&req.image, &arch)?;
+    let ImageSource::DirectTarball { distro, version } = parsed else {
+        return Ok(parsed); // OCI references and local files never resolve aliases
+    };
+
+    if let Some(resolved) = offline_resolved_version(&distro, version.as_deref()) {
+        return Ok(ImageSource::DirectTarball {
+            distro,
+            version: Some(resolved),
+        });
+    }
+
+    // Floating reference: `pull` and `--no-cache` ask upstream.
+    if recheck || req.no_cache {
+        return resolve_distro_version(&distro, version.as_deref(), &arch).map(|resolved| {
+            ImageSource::DirectTarball {
+                distro,
+                version: Some(resolved),
+            }
+        });
+    }
+
+    // The boot path consults the cache first: no network on a hit.
+    let alias = version.as_deref().unwrap_or("latest");
+    if let Some(resolved) = newest_cached_version(cache_dir, &distro, &arch, alias) {
+        log::debug!(
+            "floating reference {alias:?} boots the newest cached entry ({resolved}); \
+             `pull` re-resolves it"
+        );
+        return Ok(ImageSource::DirectTarball {
+            distro,
+            version: Some(resolved),
+        });
+    }
+
+    // Nothing cached: resolution has to answer, and a network error
+    // is then the honest failure — there is nothing local to boot.
+    resolve_distro_version(&distro, version.as_deref(), &arch)
+        .map(|resolved| ImageSource::DirectTarball {
+            distro,
+            version: Some(resolved),
+        })
+        .map_err(|e| {
+            Error::Other(anyhow::Error::from(e).context(
+                "no cached entry for this floating reference; resolving it needs the network",
+            ))
+        })
+}
+
+/// The newest cached entry a floating distro alias can boot, read
+/// straight from entry names (`{distro}-{version}-{arch}.tar.gz`).
+/// An Alpine series alias ("3.23") floats only within its series;
+/// "edge" floats among date-stamped versions ("20250401"); every
+/// other alias floats across the distro's dotted releases.
+fn newest_cached_version(
+    cache_dir: &Path,
+    distro: &Distro,
+    arch: &str,
+    alias: &str,
+) -> Option<String> {
+    let distro_name = match distro {
+        Distro::Ubuntu => "ubuntu",
+        Distro::Alpine => "alpine",
+    };
+    let series = alias.matches('.').count() == 1;
+    let prefix = format!("{distro_name}-");
+    let suffix = format!("-{}.tar.gz", map_arch(*distro, arch));
+    let mut best: Option<(Vec<u64>, String)> = None;
+    for entry in std::fs::read_dir(cache_dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(version) = name
+            .strip_prefix(&prefix)
+            .and_then(|n| n.strip_suffix(&suffix))
+        else {
+            continue;
+        };
+        // A version is dots and digits only. That shape, the distro
+        // prefix and the arch suffix together keep sidecars and
+        // foreign entries out.
+        let dotted = version.contains('.');
+        if version.is_empty()
+            || dotted == (alias == "edge")
+            || !version.chars().all(|c| c.is_ascii_digit() || c == '.')
+            || (series && !version.starts_with(&format!("{alias}.")))
+        {
+            continue;
+        }
+        let rank: Vec<u64> = version.split('.').filter_map(|p| p.parse().ok()).collect();
+        let better = match &best {
+            Some((top, _)) => rank > *top,
+            None => true,
+        };
+        if better {
+            best = Some((rank, version.to_string()));
+        }
+    }
+    best.map(|(_, version)| version)
+}
+
 impl RootfsCache {
     /// Resolve `req`, download through the cache when needed, and copy
     /// the entry image into a fresh scratch directory (removed when the
@@ -52,9 +174,14 @@ impl RootfsCache {
     /// progress is reported through `progress`.
     ///
     /// This is the boot path, not the freshness path: a present entry
-    /// is trusted as-is and the registry is never contacted — the
-    /// refresh decision belongs to [`RootfsCache::pull`]. A cold cache
-    /// pulls by default, because there is nothing to boot otherwise.
+    /// is trusted as-is and neither a registry nor a distro CDN is
+    /// contacted. A reference that names one entry exactly — an Ubuntu
+    /// YY.MM, a known codename, a full Alpine X.Y.Z — resolves
+    /// offline; a floating alias ("latest", "lts", "edge", an Alpine
+    /// "X.Y" series) boots the newest cached entry for the distro.
+    /// The refresh decision belongs to [`RootfsCache::pull`]. A cold
+    /// cache pulls by default, because there is nothing to boot
+    /// otherwise.
     pub fn prepare(&self, req: &PrepareRequest, progress: &dyn Progress) -> Result<PreparedRootfs> {
         let (source, cache_path, _) = self.ensure_entry(req, progress, false)?;
         let scratch = tempfile::tempdir().context("Failed to create temporary directory")?;
@@ -142,7 +269,7 @@ impl RootfsCache {
         recheck: bool,
     ) -> Result<(ImageSource, PathBuf, bool)> {
         let arch = req.resolved_arch();
-        let source = resolve_source(&req.image, &arch)?;
+        let source = resolve_for_request(req, &self.dir, recheck)?;
 
         if let ImageSource::LocalTarball { path } = &source {
             if recheck {
@@ -351,15 +478,83 @@ mod tests {
             "ubuntu@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         );
         // A pinned OCI source resolves without the network, so
-        // resolve_source succeeds; the entry is absent, so pull takes
+        // parse_image_ref succeeds; the entry is absent, so pull takes
         // the download path and fails in fill_entry (no registry
         // reachable in the sandbox, or a real fetch otherwise) — both
         // outcomes prove the decision, so only the resolution is
         // asserted here.
         let arch = req.resolved_arch();
-        let source = resolve_source(&req.image, &arch).unwrap();
+        let source = parse_image_ref(&req.image, &arch).unwrap();
         assert!(matches!(source, ImageSource::OciImage { .. }));
         assert!(!cache.tarball_path(&source, &arch).exists());
+    }
+
+    fn touch_entry(cache: &RootfsCache, name: &str) {
+        let path = cache.dir().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"placeholder").unwrap();
+    }
+
+    #[test]
+    fn a_floating_alias_boots_the_newest_cached_entry_without_the_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = RootfsCache::new(dir.path().to_path_buf());
+        touch_entry(&cache, "alpine-3.23.0-x86_64.tar.gz");
+        touch_entry(&cache, "alpine-3.22.9-x86_64.tar.gz");
+
+        let req = PrepareRequest::new("alpine:3.23");
+        let (source, path, downloaded) = cache.ensure_entry(&req, &NoProgress, false).unwrap();
+        assert!(!downloaded);
+        assert_eq!(path, dir.path().join("alpine-3.23.0-x86_64.tar.gz"));
+        let ImageSource::DirectTarball { version, .. } = source else {
+            panic!("expected a direct tarball");
+        };
+        assert_eq!(version.as_deref(), Some("3.23.0"));
+    }
+
+    #[test]
+    fn a_series_alias_floats_only_within_its_series() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = RootfsCache::new(dir.path().to_path_buf());
+        touch_entry(&cache, "alpine-3.20.3-x86_64.tar.gz");
+        touch_entry(&cache, "alpine-3.23.0-x86_64.tar.gz");
+
+        let req = PrepareRequest::new("alpine:3.23");
+        let (_, path, _) = cache.ensure_entry(&req, &NoProgress, false).unwrap();
+        assert_eq!(path, dir.path().join("alpine-3.23.0-x86_64.tar.gz"));
+    }
+
+    #[test]
+    fn an_edge_alias_floats_among_date_stamped_entries_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = RootfsCache::new(dir.path().to_path_buf());
+        touch_entry(&cache, "alpine-20250401-x86_64.tar.gz");
+        touch_entry(&cache, "alpine-3.23.0-x86_64.tar.gz");
+
+        let req = PrepareRequest::new("alpine:edge");
+        let (_, path, _) = cache.ensure_entry(&req, &NoProgress, false).unwrap();
+        assert_eq!(path, dir.path().join("alpine-20250401-x86_64.tar.gz"));
+
+        // Plain "alpine" floats among releases; the edge date is
+        // invisible to it.
+        let req = PrepareRequest::new("alpine");
+        let (_, path, _) = cache.ensure_entry(&req, &NoProgress, false).unwrap();
+        assert_eq!(path, dir.path().join("alpine-3.23.0-x86_64.tar.gz"));
+    }
+
+    #[test]
+    fn a_floating_ubuntu_alias_picks_the_newest_cached_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = RootfsCache::new(dir.path().to_path_buf());
+        touch_entry(&cache, "ubuntu-24.04-amd64.tar.gz");
+        touch_entry(&cache, "ubuntu-26.04-amd64.tar.gz");
+
+        let req = PrepareRequest::new("ubuntu:lts");
+        let (source, _, _) = cache.ensure_entry(&req, &NoProgress, false).unwrap();
+        let ImageSource::DirectTarball { version, .. } = source else {
+            panic!("expected a direct tarball");
+        };
+        assert_eq!(version.as_deref(), Some("26.04"));
     }
 
     #[test]

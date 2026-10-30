@@ -220,16 +220,22 @@ stop:
   the download proceeds unverified with a warning instead of
   hard-failing. That is a deliberate trade, not an oversight.
 - The cache trusts its own entries, and `run` never contacts a
-  registry on a cache hit: a present entry is booted as-is, the way
-  `docker run` uses the local image. The freshness operation is
+  registry or a distro CDN on a cache hit: a present entry is booted
+  as-is, the way `docker run` uses the local image. A reference that
+  names one entry exactly — an Ubuntu YY.MM, a known codename, a full
+  Alpine X.Y.Z — resolves offline; a floating alias (`latest`, `lts`,
+  `edge`, an Alpine `X.Y` series) boots the newest cached entry for
+  the distro, matching the series or the edge flavor it floats in,
+  and needs the network only on a miss. The freshness operation is
   `pull` (the CLI command and the library's `RootfsCache::pull`):
-  it re-checks unpinned OCI tags against the registry digest and
+  it re-checks every unpinned OCI tag against the registry digest and
   re-resolves floating distro aliases, downloading only what moved —
-  `docker pull` semantics. Digest pins, pinned tags and numbered
-  distro tarballs are immutable to both; on a network error `pull`
-  keeps the cached image with a warning. `--no-cache` is the
-  force-redownload escape hatch. The trade: a stale `:latest` boots
-  until someone pulls, exactly as in docker.
+  `docker pull` semantics. Digest pins and numbered distro tarballs
+  are immutable to both; on a network error `pull` keeps the cached
+  image with a warning. `--no-cache` is the force-redownload escape
+  hatch, and it resolves upstream like a pull. The trade: a stale
+  `:latest` or a stale alias boots until someone pulls, exactly as in
+  docker.
 - Concurrent runs of the same image are safe, not efficient: each
   writes its own partial file and the last atomic rename wins, so two
   racers download twice rather than corrupt anything.
