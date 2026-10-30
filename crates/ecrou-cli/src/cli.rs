@@ -7,7 +7,7 @@ use clap::{Args, Parser, Subcommand};
     name = "ecrou",
     version,
     about = "Run commands in disposable microVMs on libkrun",
-    after_help = "Examples:\n  ecrou run -it alpine                      a shell in the machine\n  ecrou run ubuntu -- uname -a              one command; its exit code propagates\n  ecrou run -v $PWD:/src ubuntu -- make     share the working tree into the machine\n  ecrou pull alpine                         fetch or refresh the cache entry\n  ecrou probe                               report what a run would find on this host"
+    after_help = "Examples:\n  ecrou run -it alpine                      a shell in the machine\n  ecrou run ubuntu -- uname -a              one command\n  ecrou run -v $PWD:/src ubuntu -- make     share the working tree into the machine\n  ecrou pull alpine                         fetch or refresh an image\n  ecrou probe                               check for requirements"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -19,7 +19,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Run a command in a fresh microVM
+    /// Run a command in a microVM from an image
     ///
     /// IMAGE is a distro name (alpine, ubuntu:noble), an OCI image
     /// reference (ghcr.io/org/image:tag, ubuntu@sha256:...), or a
@@ -29,7 +29,7 @@ pub enum Command {
     /// away. Persistence crosses a --volume share or it does not
     /// happen.
     Run(RunArgs),
-    /// Fetch or refresh an image's cache entry without booting it
+    /// Download an image from a registry
     ///
     /// Unpinned OCI tags are re-checked against the registry digest
     /// and floating distro aliases (latest, lts, edge) re-resolved;
@@ -43,7 +43,7 @@ pub enum Command {
         #[arg(long)]
         no_cache: bool,
     },
-    /// Report what a run would find on this host
+    /// Check for ecrou requirements
     ///
     /// KVM working (device, API version, nested-virt state), the
     /// engine (libkrun.so.1) loadable, and the image cache usable.
