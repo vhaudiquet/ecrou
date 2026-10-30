@@ -17,10 +17,10 @@ use crate::progress::Progress;
 use crate::registry::fetch_oci_digest;
 use crate::Result;
 
-/// Whether an OCI image with a floating tag (":latest") has moved since
-/// it was cached: fetch the current manifest digest from the registry
-/// and compare it against the digest stored from the last download.
-/// Pinned tags are assumed immutable; a network error keeps the cache
+/// Whether an OCI image with an unpinned tag has moved since it was
+/// cached: fetch the current manifest digest from the registry and
+/// compare it against the digest stored from the last download. A
+/// digest pin is never checked; a network error keeps the cache
 /// rather than hard-failing; anything else is simply current.
 pub(crate) fn oci_freshness_changed(source: &ImageSource, cache_path: &Path) -> bool {
     if !cache_path.exists() {
@@ -36,8 +36,10 @@ pub(crate) fn oci_freshness_changed(source: &ImageSource, cache_path: &Path) -> 
     else {
         return false;
     };
-    // A digest pin is immutable by definition; so is any non-latest tag.
-    if digest.is_some() || tag != "latest" {
+    // A digest pin is immutable by definition: the pin names the
+    // manifest. An unpinned tag is a mutable pointer — every one of
+    // them, not just ":latest" — so a pull re-checks them all.
+    if digest.is_some() {
         return false;
     }
     match fetch_oci_digest(registry, repository, tag) {
