@@ -63,6 +63,9 @@ parts:
     rust-channel: "1.98.1"
     rust-path: [crates/ecrou-cli]
     build-packages: [cmake, perl]
+    # mkfs.ext4 builds the cache image and debugfs provisions it; both
+    # ship in e2fsprogs and run as child processes of the binary.
+    stage-packages: [e2fsprogs]
     override-pull: |
       craftctl default
       # [workspace.package] version — the single `version = "..."` at
@@ -94,7 +97,10 @@ parts:
     source-depth: 1
     rust-channel: "1.98.1"
     override-build: |
-      cargo build --release -p libkrun --features net
+      # blk turns on the virtio-blk device: the rootfs crosses as a
+      # raw ext4 image (krun_add_disk + krun_set_root_disk_remount),
+      # which is what makes guest-side chown work.
+      cargo build --release -p libkrun --features net,blk
       install -Dm755 target/release/libkrun.so \
         "$CRAFT_PART_INSTALL/lib/libkrun.so.1.19.7"
       ln -s libkrun.so.1.19.7 "$CRAFT_PART_INSTALL/lib/libkrun.so.1"
