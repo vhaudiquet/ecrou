@@ -117,18 +117,6 @@ impl Krun {
         krun_ret(unsafe { f(ctx_id, vcpus, ram_mib) }, "krun_set_vm_config")
     }
 
-    /// `krun_set_root`: the virtiofs share that becomes the guest root.
-    pub fn set_root(&self, ctx_id: u32, root: &Path) -> Result<()> {
-        let root_c = path_cstring(root)?;
-        let f = symbol!(
-            self.lib,
-            b"krun_set_root\0",
-            unsafe extern "C" fn(u32, *const c_char) -> i32
-        );
-        // Safety: root_c is NUL-terminated and outlives the call.
-        krun_ret(unsafe { f(ctx_id, root_c.as_ptr()) }, "krun_set_root")
-    }
-
     /// `krun_add_disk`: a raw image as a virtio-blk device. An engine
     /// built without the blk feature ships no such symbol, and the
     /// lookup failure names that, not age.
@@ -262,18 +250,6 @@ impl Krun {
             unsafe { f(ctx_id, path_c.as_ptr(), argv_c.ptr(), envp_c.ptr()) },
             "krun_set_exec",
         )
-    }
-
-    /// `krun_set_env`: extra environment for the payload.
-    pub fn set_env(&self, ctx_id: u32, envp: &[String]) -> Result<()> {
-        let envp_c = CArgs::build(envp)?;
-        let f = symbol!(
-            self.lib,
-            b"krun_set_env\0",
-            unsafe extern "C" fn(u32, *const *const c_char) -> i32
-        );
-        // Safety: envp_c is NUL-terminated and outlives the call.
-        krun_ret(unsafe { f(ctx_id, envp_c.ptr()) }, "krun_set_env")
     }
 
     /// `krun_set_console_output`: redirect the guest console to a file.
@@ -437,9 +413,9 @@ mod tests {
 
     #[test]
     fn krun_ret_maps_negated_errno() {
-        let err = krun_ret(-2, "krun_set_root").unwrap_err();
+        let err = krun_ret(-2, "krun_set_vm_config").unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("krun_set_root failed"), "{msg}");
+        assert!(msg.contains("krun_set_vm_config failed"), "{msg}");
         assert!(msg.contains("No such file"), "{msg}");
     }
 }

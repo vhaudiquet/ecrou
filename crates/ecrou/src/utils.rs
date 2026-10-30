@@ -160,28 +160,6 @@ pub fn map_oci_arch(arch: &str) -> String {
     Arch::from_str(arch).oci_name().to_string()
 }
 
-// ============================================================================
-// Shell detection
-// ============================================================================
-
-/// Detect the best available shell in a rootfs
-/// Checks for bash first, falls back to sh
-/// Returns the path relative to the rootfs (e.g., "/bin/bash")
-pub fn detect_shell(rootfs: &Path) -> &'static str {
-    // Check for bash first (preferred)
-    if rootfs.join("bin/bash").exists() {
-        "/bin/bash"
-    } else if rootfs.join("bin/sh").exists() {
-        "/bin/sh"
-    } else if rootfs.join("usr/bin/bash").exists() {
-        "/usr/bin/bash"
-    } else if rootfs.join("usr/bin/sh").exists() {
-        "/usr/bin/sh"
-    } else {
-        "/bin/sh" // Will fail with clear error if not present
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
