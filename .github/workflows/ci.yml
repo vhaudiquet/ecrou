@@ -70,7 +70,7 @@ jobs:
           echo "924cd545080aaf5da66740d12a51b7a5cbd9a5c0b502d21cbef9bc82bf1c8b6b  /tmp/libkrunfw5.deb" | sha256sum -c
           dpkg -x /tmp/libkrunfw5.deb /tmp/libkrunfw
           git clone --depth 1 --branch v1.19.7 https://github.com/containers/libkrun /tmp/libkrun
-          cargo build --release --manifest-path /tmp/libkrun/Cargo.toml -p libkrun --features net
+          cargo build --release --manifest-path /tmp/libkrun/Cargo.toml -p libkrun --features net,blk
           mkdir /tmp/engine
           cp /tmp/libkrun/target/release/libkrun.so /tmp/engine/libkrun.so.1
           cp /tmp/libkrunfw/usr/lib/x86_64-linux-gnu/libkrunfw.so.5.5.0 /tmp/engine/
