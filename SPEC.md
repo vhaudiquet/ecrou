@@ -185,8 +185,8 @@ they need host setup the budget cannot afford. Port publishing is how
 a later in-guest agent serves the host (Later).
 
 **Memory and CPUs.** Default 1G and all logical CPUs; `-m` overrides.
-A per-command machine is provisioned per command, and agent consumers
-run several concurrently.
+Each command gets its own machine, and agent consumers run several
+concurrently.
 
 ## Trust model
 
@@ -279,10 +279,14 @@ build is deleted.
   correct-and-slow v1 posture graduates into this.
 - **Guest agent, long-lived machines.** Exec without a boot; the shape
   to grow into when per-command VMs stop being right.
-- **Layer eviction.** Provisioned layers are already keyed: a spec
-  file (base, packages, run) hashed with its base reference, named by
-  `--layer` for `run --layer`. Nothing prunes the derived entries yet;
-  eviction (LRU or an explicit prune) keeps them bounded.
+- **A build story for hosts that cannot build.** Provision was cut
+  from 0.1: a runtime that also builds images is two products, and
+  the OCI ecosystem already builds images — CI, digests, scanning.
+  What has no answer yet is the locked-down host with no daemon, no
+  namespaces, no way to run a builder. There, provision by booting —
+  the guest installs, the host stays confined, the artifact is a
+  keyed cache entry. Waits on TSI throughput and on someone actually
+  needing it.
 - **passt** (`krun_set_passt_fd`) if TSI throughput or UDP listening
   ever matters.
 - **An agent in the guest** over port publishing: an http backend

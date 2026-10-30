@@ -29,34 +29,6 @@ pub enum Command {
     /// away. Persistence crosses a --volume share or it does not
     /// happen.
     Run(RunArgs),
-    /// Bake a provisioned layer over a base image
-    ///
-    /// Two shapes. --spec FILE describes the layer in checked-in YAML
-    /// (base, packages, run); the layer is keyed by the file's
-    /// content, so the same spec never provisions twice and a changed
-    /// spec never reuses an old layer, and --layer NAME names it for
-    /// `run --layer NAME`. `provision IMAGE -- COMMAND` bakes the
-    /// command into the image's cache entry itself: every later boot
-    /// of that image carries what the command installed.
-    Provision {
-        /// Base image: distro name or OCI reference; not needed when
-        /// the spec carries a base
-        image: Option<String>,
-        /// Provisioning spec file (YAML: base, packages, run); the
-        /// layer it describes is keyed by the file's content
-        #[arg(long)]
-        spec: Option<std::path::PathBuf>,
-        /// Name the provisioned layer, so `run --layer NAME` boots it
-        #[arg(long)]
-        layer: Option<String>,
-        /// Ignore the cache: re-download the base and re-provision
-        #[arg(long)]
-        no_cache: bool,
-        /// Provisioning command, baked into the image's cache entry
-        /// (use with IMAGE, without --spec)
-        #[arg(last = true)]
-        command: Vec<String>,
-    },
     /// Fetch or refresh an image's cache entry without booting it
     ///
     /// Unpinned OCI tags are re-checked against the registry digest
@@ -82,9 +54,8 @@ pub enum Command {
 #[derive(Args, Debug)]
 pub struct RunArgs {
     /// Distro name, OCI image reference, or a local rootfs archive
-    /// path (./rootfs.tar.gz); not needed with --layer
-    #[arg(required_unless_present = "layer")]
-    pub image: Option<String>,
+    /// path (./rootfs.tar.gz)
+    pub image: String,
     /// Keep the machine's stdin open: the host's stdin feeds the
     /// guest, so shells and prompts read typed input
     #[arg(short = 'i', long)]
@@ -122,10 +93,6 @@ pub struct RunArgs {
     /// Ignore the cache: download the image fresh
     #[arg(long)]
     pub no_cache: bool,
-    /// Boot a named provisioned layer (see provision --layer)
-    /// instead of an image
-    #[arg(long)]
-    pub layer: Option<String>,
 }
 
 /// Parse one `HOST:GUEST[:ro]` volume specification. The guest path
@@ -199,7 +166,7 @@ mod tests {
         };
         assert!(args.interactive);
         assert!(args.tty);
-        assert_eq!(args.image.as_deref(), Some("alpine"));
+        assert_eq!(args.image, "alpine");
     }
 
     #[test]

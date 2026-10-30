@@ -129,9 +129,9 @@ fn extract_multi_layer_oci(
 
     let manifest_path = temp_dir.path().join("layers.manifest");
     if !manifest_path.exists() {
-        // Not our layer-bundle layout: a provisioned rootfs persisted over
-        // an OCI cache entry (the dispatch above keys on the "oci-" filename
-        // prefix).  The outer archive is a plain rootfs tarball.
+        // Not our layer-bundle layout: an "oci-" entry whose outer
+        // archive is a plain rootfs tarball (the dispatch keys on the
+        // filename prefix, so a non-bundle entry still lands here).
         log::debug!("No layers.manifest in bundle; extracting as plain rootfs tarball");
         return extract_single_archive(tarball, dest, progress);
     }

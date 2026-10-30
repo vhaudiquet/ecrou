@@ -20,143 +20,8 @@ fn main() -> std::process::ExitCode {
     logger::init(cli.verbose);
     match cli.command {
         Command::Run(args) => cmd_run(&args, cli.verbose),
-        Command::Provision {
-            image,
-            spec,
-            layer,
-            no_cache,
-            command,
-        } => cmd_provision(image, spec, layer, no_cache, &command, cli.verbose),
         Command::Pull { image, no_cache } => cmd_pull(&image, no_cache, cli.verbose),
         Command::Probe => cmd_probe(),
-    }
-}
-
-fn cmd_provision(
-    image: Option<String>,
-    spec: Option<std::path::PathBuf>,
-    layer: Option<String>,
-    no_cache: bool,
-    command: &[String],
-    cli_verbose: bool,
-) -> std::process::ExitCode {
-    use ecrou::cache::RootfsCache;
-    use ecrou::rootfs::PrepareRequest;
-    use ecrou::spec::ProvisionSpec;
-
-    // Two shapes: `provision IMAGE -- COMMAND` bakes a one-off
-    // command; `provision --spec FILE --layer NAME` bakes a checked-in
-    // spec into a named, content-keyed layer. A spec plus a command
-    // has no single meaning.
-    if spec.is_none() == command.is_empty() {
-        return fail(&anyhow::anyhow!(
-            "provision needs either a spec file (--spec) or a command: \
-             ecrou provision <IMAGE> -- <COMMAND...>"
-        ));
-    }
-
-    let level = if cli_verbose {
-        LogLevel::Verbose
-    } else {
-        LogLevel::Normal
-    };
-    let mut options = RunOptions {
-        log_level: level,
-        // The machine exists to change the rootfs, not to cross a
-        // share: the workspace would ride the persist into the cache.
-        ..RunOptions::default()
-    };
-    options.workdir = "/".to_owned();
-
-    let progress: &dyn Progress = &TermProgress::new();
-    let dir = match RootfsCache::default_dir() {
-        Ok(dir) => dir,
-        Err(err) => return fail(&anyhow::Error::new(err)),
-    };
-    let cache = RootfsCache::new(dir);
-
-    // The spec decides the request: its base (or the positional
-    // image), its key, and its script — the packages through the
-    // base's package manager, then the run block. The key hashes the
-    // raw bytes and the base reference, so the cache entries two
-    // projects see can never cross.
-    let mut request = PrepareRequest::new(String::new());
-    request.no_cache = no_cache;
-    let mut script;
-    match &spec {
-        Some(path) => {
-            let bytes = match std::fs::read(path) {
-                Ok(bytes) => bytes,
-                Err(err) => return fail(&anyhow::anyhow!("reading {}: {err}", path.display())),
-            };
-            let parsed = match ProvisionSpec::parse(&bytes) {
-                Ok(parsed) => parsed,
-                Err(err) => return fail(&err),
-            };
-            let base = match parsed.base.clone().or_else(|| image.clone()) {
-                Some(base) => base,
-                None => {
-                    return fail(&anyhow::anyhow!(
-                        "the spec has no base and no image was named: \
-                         ecrou provision <IMAGE> --spec {path}",
-                        path = path.display()
-                    ))
-                }
-            };
-            script = parsed.script();
-            let key = ProvisionSpec::key(&bytes, &base);
-            request.image = base;
-            request.layer_key = Some(key);
-        }
-        None => {
-            if layer.is_some() {
-                return fail(&anyhow::anyhow!(
-                    "--layer names a provisioned spec, not a bare command"
-                ));
-            }
-            request.image = image
-                .clone()
-                .expect("clap requires an image without --spec");
-            script = command.join(" ");
-            script.push('\n');
-        }
-    }
-    options.image = request.image.clone();
-    options.command = vec!["/bin/sh".to_owned(), "-c".to_owned(), script];
-
-    let outcome = cache.prepare_provisioned(&request, progress, |rootfs| {
-        let code = ecrou::vm::run_prepared(rootfs, &options)?;
-        if code != 0 {
-            anyhow::bail!(
-                "the provisioning command exited {code}; the cache entry was left unprovisioned"
-            );
-        }
-        Ok(())
-    });
-    match outcome {
-        Ok(_rootfs) => {
-            // The pointer lands only after the entry does: a name
-            // that resolves is a layer that boots.
-            if let (Some(name), Some(key)) = (&layer, &request.layer_key) {
-                let path = match cache.resolved_entry_path(
-                    &request.image,
-                    &request.resolved_arch(),
-                    Some(key),
-                ) {
-                    Ok(path) => path,
-                    Err(err) => return fail(&anyhow::Error::new(err)),
-                };
-                let filename = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                if let Err(err) = cache.write_layer_pointer(name, &filename) {
-                    return fail(&anyhow::Error::new(err));
-                }
-            }
-            std::process::ExitCode::SUCCESS
-        }
-        Err(err) => fail(&anyhow::Error::new(err)),
     }
 }
 
@@ -171,9 +36,7 @@ fn cmd_run(args: &RunArgs, cli_verbose: bool) -> std::process::ExitCode {
         ));
     }
     let mut options = RunOptions {
-        // Without a layer the image is required by clap; with one the
-        // field is dead — the layer entry carries the rootfs.
-        image: args.image.clone().unwrap_or_default(),
+        image: args.image.clone(),
         command: args.command.clone(),
         memory: args.memory.clone(),
         workdir: args.workdir.clone(),
@@ -187,7 +50,6 @@ fn cmd_run(args: &RunArgs, cli_verbose: bool) -> std::process::ExitCode {
         interactive: args.interactive,
         tty: args.tty,
         no_cache: args.no_cache,
-        layer: args.layer.clone(),
         capture: args.capture.clone(),
         ..RunOptions::default()
     };

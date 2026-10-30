@@ -13,8 +13,8 @@
 //! socket, which is what lets ecrou run inside a strict snap's seccomp
 //! allowlist. See SPEC.md.
 //!
-//! The main entry points are [`rootfs`] (cache-aware rootfs preparation
-//! and persistence) and [`vm`] (running a command inside a prepared
+//! The main entry points are [`rootfs`] (cache-aware rootfs
+//! preparation) and [`vm`] (running a command inside a prepared
 //! rootfs). Public functions return [`Result`] carrying the [`Error`]
 //! enum, so consumers can match on host-readiness failures
 //! ([`Error::KvmUnavailable`], [`Error::ArchNotAvailable`]) versus
@@ -38,11 +38,9 @@ pub mod error;
 pub mod extract;
 pub mod guest;
 pub mod krun;
-mod pack;
 pub mod progress;
 mod registry;
 pub mod rootfs;
-pub mod spec;
 mod supervise;
 pub mod utils;
 pub mod vm;
