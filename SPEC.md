@@ -269,6 +269,14 @@ stop:
   with shares: zero hits. This test is the founding rule.
 - **T7, guest network.** An https fetch from the guest succeeds, DNS
   included; a published port is reachable from the host.
+- **T8, snap e2e.** CI builds the snap and runs `ecrou run -q -e
+  DEBIAN_FRONTEND=noninteractive ubuntu -- "apt update && apt install
+  -y fastfetch && fastfetch"` inside it: strict confinement, KVM
+  through the plug, the staged e2fsprogs, apt across the TSI proxy,
+  and the payload's exit code back through the control file. A boot
+  of alpine (`uname -r` differing from the host's) runs before it so
+  a broken environment fails fast. The apt wall time is the standing
+  re-measurement of the ln driver's throughput.
 
 ## Snap packaging
 

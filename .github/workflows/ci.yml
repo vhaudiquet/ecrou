@@ -87,3 +87,70 @@ jobs:
           ECROU_BIN: ${{ github.workspace }}/target/release/ecrou
           LD_LIBRARY_PATH: /tmp/engine
         run: cargo test -p ecrou-cli -- --ignored
+
+  snap:
+    name: snap build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same pack the release workflow publishes. Building it on
+      # every change keeps the snap from rotting between tags: the
+      # cargo part, the libkrun build, and the libkrunfw digest pins
+      # all break here first.
+      - uses: snapcore/action-build@v1
+        id: build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snap-amd64
+          path: ${{ steps.build.outputs.snap }}
+
+  e2e:
+    name: snap e2e — apt install
+    needs: snap
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: snap-amd64
+          path: snap
+
+      - name: Install the snap
+        run: |
+          test -c /dev/kvm || { echo "::error::no /dev/kvm on this runner"; exit 1; }
+          test -w /dev/kvm || sudo chmod 666 /dev/kvm
+          sudo snap install --dangerous ./snap/*.snap
+          sudo snap connect ecrou:kvm
+
+      # Diagnostics for whatever fails below: KVM state, the engine
+      # load from the snap's staged libraries, the cache directory.
+      - name: Probe
+        run: ecrou probe || true
+
+      # T8's first half, on the packaged binary: a guest kernel that
+      # differs from the host's, inside strict confinement. Fast, so a
+      # broken environment fails here instead of deep in the apt run.
+      - name: Smoke — boot alpine under confinement
+        run: |
+          set -euo pipefail
+          guest="$(timeout 10m ecrou run -q alpine -- uname -r | tail -n 1)"
+          host="$(uname -r)"
+          echo "guest kernel: $guest / host kernel: $host"
+          test -n "$guest" && test "$guest" != "$host"
+
+      # T8's second half: a real package install end to end — apt
+      # through the TSI proxy, mkfs and debugfs through the snap's
+      # staged e2fsprogs, the payload's exit code back through the
+      # control file. The ln driver's known throughput limit makes
+      # this the long pole; how long it takes is the standing
+      # re-measurement the Networking section calls for on every
+      # engine update.
+      - name: apt update && install fastfetch
+        run: |
+          set -euo pipefail
+          timeout 35m ecrou run -q -e DEBIAN_FRONTEND=noninteractive ubuntu -- \
+            "apt update && apt install -y fastfetch && fastfetch" | tee /tmp/e2e.log
+          grep -E "^OS:" /tmp/e2e.log
