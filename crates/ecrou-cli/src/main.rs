@@ -329,6 +329,31 @@ fn fail(err: &anyhow::Error) -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn traced_syscall_parses_strace_line_shapes() {
+        assert_eq!(
+            traced_syscall("1234  mount(\"/x\", \"/y\", 0) = 0"),
+            Some("mount")
+        );
+        assert_eq!(
+            traced_syscall("[pid  1234] umount2(\"/x\", 0) = 0"),
+            Some("umount2")
+        );
+        assert_eq!(
+            traced_syscall("1234  mount(\"/x\" <unfinished ...>"),
+            Some("mount")
+        );
+        // A resumed split half carries no call of its own: its '('
+        // was on the unfinished line above, which already named the
+        // syscall for the audit.
+        assert_eq!(
+            traced_syscall("[pid 1234] <... mount resumed>: \"/x\") = 0"),
+            None
+        );
+        assert_eq!(traced_syscall("strace: Process 1234 attached"), None);
+        assert_eq!(traced_syscall("++++ exited with 0 ++++"), None);
+    }
+
+    #[test]
     #[ignore = "needs the ecrou binary, libkrun, and strace; runs in CI"]
     fn t6_no_mount_or_namespace_syscalls() {
         let denied = "mount,umount2,unshare,setns,pivot_root,open_tree,move_mount,fsopen,fsmount";
@@ -355,13 +380,41 @@ mod tests {
         assert!(out.success(), "the traced run failed; see the strace log");
         let trace = std::fs::read_to_string(&trace_path).unwrap();
         let _ = std::fs::remove_file(&trace_path);
+        // The SPEC's bar is zero hits, not zero failures: a mount that
+        // succeeded is as much a violation as one the snap's seccomp
+        // allowlist would have denied. The trace contains only the
+        // traced syscalls, so an exact name at the head of a line is a
+        // hit; exact comparison also keeps `mount` from matching
+        // `umount2`. Resumed-split lines (`<... mount resumed>`) carry
+        // the name behind a `<... ` prefix.
+        let denied: Vec<&str> = denied.split(',').collect();
         for line in trace.lines() {
-            let denied_call = denied.split(',').any(|syscall| line.contains(syscall));
-            let failed = line.contains("= -1 EPERM") || line.contains("= -1 ENOSYS");
-            assert!(
-                !(denied_call && failed),
-                "denied syscall in the trace: {line}"
-            );
+            let head = traced_syscall(line);
+            if let Some(head) = head {
+                if denied.contains(&head) {
+                    panic!("denied syscall in the trace: {line}");
+                }
+            }
         }
+    }
+
+    /// The syscall name a strace output line traces, or None for
+    /// chatter. Line shapes covered: `1234  mount(…)`,
+    /// `[pid  1234] umount2(…)`, unfinished split halves, timestamps,
+    /// and lines without a call (`++++ exited with 0 ++++`). The call
+    /// is the last identifier-like token before the parenthesis; a
+    /// pid or a timestamp never qualifies (digits alone or
+    /// punctuation). A resumed split half has no parenthesis — the
+    /// unfinished half that names the call always precedes it, so
+    /// None loses the audit nothing.
+    fn traced_syscall(line: &str) -> Option<&str> {
+        let open = line.find('(')?;
+        let tokens: Vec<&str> = line[..open].split_whitespace().collect();
+        let is_call = |t: &str| {
+            !t.is_empty()
+                && t.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        };
+        tokens.iter().rev().find(|t| is_call(t)).copied()
     }
 }
