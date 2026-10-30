@@ -73,7 +73,7 @@ pub struct RunArgs {
     /// (repeatable; the guest path must be absolute)
     #[arg(short = 'v', long = "volume")]
     pub volumes: Vec<String>,
-    /// Guest memory size (bytes, or with a K/M/G suffix)
+    /// Guest memory size in MiB, or with a K/M/G suffix (2048, 512M, 1G)
     #[arg(short = 'm', long, default_value = "1G")]
     pub memory: String,
     /// Working directory inside the machine
