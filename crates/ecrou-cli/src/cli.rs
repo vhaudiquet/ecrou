@@ -49,6 +49,19 @@ pub enum Command {
         #[arg(last = true)]
         command: Vec<String>,
     },
+    /// Fetch or refresh an image's cache entry without booting it:
+    /// re-checks unpinned OCI tags against the registry and floating
+    /// distro aliases against the distro, downloading only when the
+    /// entry is absent or has moved. `run` never contacts the
+    /// registry on a cached image — this is the refresh operation.
+    Pull {
+        /// Distribution name or OCI image reference
+        image: String,
+        /// Ignore the cache: re-download even when the entry is
+        /// present and current
+        #[arg(long)]
+        no_cache: bool,
+    },
     /// Report what a run would find on this host
     Probe,
 }

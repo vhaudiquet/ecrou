@@ -243,9 +243,12 @@ for narration, `Progress` for long operations.
 ### Rootfs lifecycle (ported)
 
 `RootfsCache::new(dir)` / `default_dir()`, `prepare`,
-`prepare_provisioned`, `persist`, `PrepareRequest`, `PreparedRootfs`:
-ecr's semantics verbatim, including digest freshness on `:latest` and
-the `.provisioned` hot-cell marker. The per-run scratch copy is
+`prepare_provisioned`, `pull`, `persist`, `PrepareRequest`,
+`PreparedRootfs`, `Pulled`: `prepare` is the boot path — a present
+entry is trusted, the registry is never contacted on a hit, a cold
+cache downloads. `pull` is the explicit freshness check (unpinned
+tags re-verified, moved digests re-downloaded, nothing extracted).
+Plus the `.provisioned` hot-cell marker. The per-run scratch copy is
 `PreparedRootfs` as ecr already builds it. See ecr's SPEC for the
 reference description; differences are the cache directory and the
 absent kernel entries only.
@@ -296,8 +299,17 @@ composable. A boot failure leaves the files absent.
 ```
 ecrou run [OPTIONS] <IMAGE> [-- COMMAND...]
 ecrou provision [OPTIONS] <IMAGE> [-- COMMAND...]
+ecrou pull [OPTIONS] <IMAGE>
 ecrou probe
 ```
+
+`pull` fetches or refreshes the image's cache entry without booting
+it: it re-resolves floating references (distro aliases like
+`latest`/`lts`/`edge`, unpinned OCI tags against the registry
+digest) and downloads only when the entry is absent or has moved.
+It is the freshness operation — see the trust model below for how
+`run` and `pull` divide the work. Local archives are rejected:
+a file on disk has nothing to fetch.
 
 The image is a distro name (`alpine`, `ubuntu:noble`), an OCI
 reference (`ghcr.io/org/image:tag`, `ubuntu@sha256:…`,
@@ -395,11 +407,17 @@ stop:
   publishes next to them. When the checksum artifact cannot be fetched
   the download proceeds unverified with a warning instead of
   hard-failing. That is a deliberate trade, not an oversight.
-- The cache trusts its own entries. Once written, an entry is never
-  re-verified, except OCI `:latest` tags, which are re-checked against
-  the registry digest on every run. Digest pins, pinned tags and
-  distro tarballs are assumed immutable; `--no-cache` and the
-  digest-changed path are the escape hatches.
+- The cache trusts its own entries, and `run` never contacts a
+  registry on a cache hit: a present entry is booted as-is, the way
+  `docker run` uses the local image. The freshness operation is
+  `pull` (the CLI command and the library's `RootfsCache::pull`):
+  it re-checks unpinned OCI tags against the registry digest and
+  re-resolves floating distro aliases, downloading only what moved —
+  `docker pull` semantics. Digest pins, pinned tags and numbered
+  distro tarballs are immutable to both; on a network error `pull`
+  keeps the cached image with a warning. `--no-cache` is the
+  force-redownload escape hatch. The trade: a stale `:latest` boots
+  until someone pulls, exactly as in docker.
 - Concurrent runs of the same image are safe, not efficient: each
   writes its own partial file and the last atomic rename wins, so two
   racers download twice rather than corrupt anything.

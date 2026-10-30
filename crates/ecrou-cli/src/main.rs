@@ -7,6 +7,8 @@ mod logger;
 mod progress;
 
 use clap::Parser;
+use ecrou::cache::RootfsCache;
+use ecrou::rootfs::PrepareRequest;
 use ecrou::vm::RunOptions;
 use ecrou::{LogLevel, NoProgress, Progress};
 
@@ -25,6 +27,7 @@ fn main() -> std::process::ExitCode {
             no_cache,
             command,
         } => cmd_provision(image, spec, layer, no_cache, &command, cli.verbose),
+        Command::Pull { image, no_cache } => cmd_pull(&image, no_cache, cli.verbose),
         Command::Probe => cmd_probe(),
     }
 }
@@ -216,6 +219,32 @@ fn cmd_run(args: &RunArgs, cli_verbose: bool) -> std::process::ExitCode {
     };
     match ecrou::vm::run(&options, progress) {
         Ok(code) => std::process::ExitCode::from(code.clamp(0, 255) as u8),
+        Err(err) => fail(&anyhow::Error::new(err)),
+    }
+}
+
+/// Pull an image into the cache without booting it.
+fn cmd_pull(image: &str, no_cache: bool, _cli_verbose: bool) -> std::process::ExitCode {
+    let progress: &dyn Progress = &TermProgress::new();
+    let dir = match RootfsCache::default_dir() {
+        Ok(dir) => dir,
+        Err(err) => return fail(&anyhow::Error::new(err)),
+    };
+    let cache = RootfsCache::new(dir);
+
+    let mut request = PrepareRequest::new(image.to_owned());
+    request.no_cache = no_cache;
+
+    match cache.pull(&request, progress) {
+        Ok(pulled) => {
+            if pulled.downloaded {
+                println!("pulled {image}");
+            } else {
+                println!("{image} is up to date");
+            }
+            println!("  {}", pulled.cache_path.display());
+            std::process::ExitCode::SUCCESS
+        }
         Err(err) => fail(&anyhow::Error::new(err)),
     }
 }
