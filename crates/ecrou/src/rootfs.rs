@@ -95,15 +95,19 @@ impl RootfsCache {
     }
 
     /// The entry's image, built from the entry tarball when absent or
-    /// older than the tarball. Runs copy the image; the tarball is the
-    /// build input only. One writer per entry, like the download path.
+    /// older than the tarball, or when the file on disk is not an ext4
+    /// image at all — the remains of a build that died before its
+    /// atomic rename. Runs copy the image; the tarball is the build
+    /// input only. One writer per entry, like the download path.
     fn ensure_image(&self, tarball: &Path, image: &Path, progress: &dyn Progress) -> Result<()> {
         let mtime = |p: &Path| {
             std::fs::metadata(p)
                 .and_then(|m| m.modified())
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
         };
-        let fresh = || image.exists() && mtime(image) >= mtime(tarball);
+        let fresh = || {
+            image.exists() && crate::image::looks_like_ext4(image) && mtime(image) >= mtime(tarball)
+        };
         if fresh() {
             return Ok(());
         }

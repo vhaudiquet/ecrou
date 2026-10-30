@@ -50,9 +50,49 @@ pub(crate) fn build_rootfs_image(
     result
 }
 
-/// Run mke2fs over the archive. The filesystem size and inode count
-/// come from a scan of the archive: mke2fs derives neither from a tar.
+/// Whether `image` carries an ext4 superblock: the superblock starts
+/// at byte 1024 of the file and s_magic sits 56 bytes into it, so the
+/// pair is at byte 1080, little-endian. Anything else is the remains
+/// of an interrupted or failed build, and the freshness check
+/// rebuilds over it instead of booting zeros.
+pub(crate) fn looks_like_ext4(image: &Path) -> bool {
+    use std::io::{Read, Seek};
+    let mut magic = [0u8; 2];
+    std::fs::File::open(image)
+        .and_then(|mut f| {
+            f.seek(std::io::SeekFrom::Start(1080))?;
+            f.read_exact(&mut magic)?;
+            Ok(magic)
+        })
+        .map(|m| m == [0x53, 0xEF])
+        .unwrap_or(false)
+}
+
+/// Build the entry image: mke2fs consumes the archive (merged first
+/// when the tarball is an OCI layer bundle) and the result publishes
+/// atomically.
 fn mkfs_from_tar(tarball: &Path, image: &Path) -> anyhow::Result<()> {
+    // The build lands in a sibling file first and renames over the
+    // image only on success. mke2fs creates and sizes the file before
+    // it populates, so a failed build would otherwise leave a
+    // recent-looking image full of zeros at the final name — newer
+    // than the tarball it came from, and trusted by the freshness
+    // check forever after.
+    let staging = image.with_extension("part");
+    let built = build_ext4(tarball, &staging);
+    if built.is_ok() {
+        std::fs::rename(&staging, image)
+            .with_context(|| format!("publishing {}", image.display()))?;
+    } else {
+        let _ = std::fs::remove_file(&staging);
+    }
+    built
+}
+
+/// Create `image`, size it from a scan of the archive, and run mke2fs
+/// over it. The filesystem size and inode count come from the scan:
+/// mke2fs derives neither from a tar.
+fn build_ext4(tarball: &Path, image: &Path) -> anyhow::Result<()> {
     let (bytes, entries) = tar_scan(tarball)?;
     // Headroom for the journal, the inode tables and block rounding.
     // The file is created sparse, so generous headroom costs nothing
@@ -266,6 +306,28 @@ mod tests {
     }
 
     #[test]
+    fn a_file_without_the_magic_is_not_an_image() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("img");
+        // Freshly truncated: allocated but never populated.
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        assert!(!looks_like_ext4(&path));
+        // Too short to hold a superblock at all.
+        std::fs::write(&path, vec![0u8; 512]).unwrap();
+        assert!(!looks_like_ext4(&path));
+        // The magic, in place and little-endian.
+        let mut bytes = vec![0u8; 4096];
+        bytes[1024] = 0x00;
+        bytes[1025] = 0x08;
+        bytes[1080] = 0x53;
+        bytes[1081] = 0xEF;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(looks_like_ext4(&path));
+        // Absent files are not images either.
+        assert!(!looks_like_ext4(&work.path().join("absent")));
+    }
+
+    #[test]
     fn the_image_carries_the_tarball_ownership() {
         if !have_e2fsprogs() {
             eprintln!("SKIP: no e2fsprogs");
@@ -276,6 +338,11 @@ mod tests {
         fixture(&tarball);
         let image = work.path().join("rootfs.img");
         build(&tarball, &image);
+
+        // A finished build publishes an ext4 image and leaves no
+        // staging file behind.
+        assert!(looks_like_ext4(&image), "the built image lacks the magic");
+        assert!(!work.path().join("rootfs.part").exists());
 
         let out = Command::new("debugfs")
             .arg("-R")
