@@ -271,12 +271,16 @@ stop:
   included; a published port is reachable from the host.
 - **T8, snap e2e.** CI builds the snap and runs `ecrou run --quiet -e
   DEBIAN_FRONTEND=noninteractive ubuntu -- "apt update && apt install
-  -y fastfetch && fastfetch"` inside it: strict confinement, KVM
-  through the plug, the staged e2fsprogs, apt across the TSI proxy,
-  and the payload's exit code back through the control file. A boot
-  of alpine (`uname -r` differing from the host's) runs before it so
-  a broken environment fails fast. The apt wall time is the standing
-  re-measurement of the ln driver's throughput.
+  -y fastfetch && fastfetch --pipe --logo none"` inside it: strict
+  confinement, KVM through the plug, the staged e2fsprogs, apt across
+  the TSI proxy, and the payload's exit code back through the control
+  file. `--pipe --logo none` keeps the receipt greppable; the console
+  is a serial port and fastfetch decorates a tty with cursor escapes.
+  A boot of alpine (`uname -r` differing from the host's) runs before
+  it so a broken environment fails fast. The apt wall time is the
+  standing re-measurement of the ln driver's throughput. First data
+  point: 24 s end to end, boot and apt included, cache-warm (snap
+  0.1.0 engine, October 2026).
 
 ## Snap packaging
 

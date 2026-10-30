@@ -151,6 +151,13 @@ jobs:
       - name: apt update && install fastfetch
         run: |
           set -euo pipefail
+          # --pipe --logo none: the payload's stdout is a serial
+          # console, which fastfetch reads as a tty and decorates with
+          # cursor escapes (a first local run grepped nothing); plain
+          # output keeps the receipt readable.
           timeout 35m ecrou run --quiet -e DEBIAN_FRONTEND=noninteractive ubuntu -- \
-            "apt update && apt install -y fastfetch && fastfetch" | tee /tmp/e2e.log
-          grep -E "^OS:" /tmp/e2e.log
+            "apt update && apt install -y fastfetch && fastfetch --pipe --logo none" \
+            | tee /tmp/e2e.log
+          # Insurance, not the primary check: strip any escape
+          # sequences before anchoring on the fastfetch key.
+          sed -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' /tmp/e2e.log | grep -E "^OS:"
