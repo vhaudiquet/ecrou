@@ -77,7 +77,5 @@ docs: document the spike snap gate
   `src/` module; there is no `tests/` directory. Scope test commits to
   the module under test.
 - Comments state constraints the code cannot show; no narration.
-- Anything user-facing (CLI flags, config keys, error text users act
-  on) is reflected in `README.md` before commit.
 - Design decisions that outlive the session go to `SPEC.md`, not to
   new docs or repos.
