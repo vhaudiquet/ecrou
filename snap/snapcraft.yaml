@@ -65,7 +65,10 @@ parts:
     build-packages: [cmake, perl]
     # mkfs.ext4 builds the cache image and debugfs provisions it; both
     # ship in e2fsprogs and run as child processes of the binary.
-    stage-packages: [e2fsprogs]
+    # Populating from a tarball is dlopen("libarchive.so.13") at
+    # runtime — no hard dependency, so staging e2fsprogs alone leaves
+    # the run failing with "you need libarchive"; stage the lib too.
+    stage-packages: [e2fsprogs, libarchive13t64]
     override-pull: |
       craftctl default
       # [workspace.package] version — the single `version = "..."` at
