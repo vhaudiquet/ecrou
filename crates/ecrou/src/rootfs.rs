@@ -1,6 +1,12 @@
 //! Cache-aware rootfs lifecycle: resolve an image reference, download
-//! through the tarball cache, and extract into a scratch directory for
-//! [`crate::vm`] to boot.
+//! through the tarball cache, and build the ext4 image the machine
+//! boots. A run copies the cached image into a scratch directory,
+//! provisions its init into the copy, and throws it all away on exit.
+
+//! The image is the deliverable: mke2fs builds it straight from the
+//! tarball, so the ownership the archive records is the ownership the
+//! guest sees - guest root on a real filesystem can then change it at
+//! will, which a virtiofs share owned by the host user never allowed.
 //!
 //! The run path is [`RootfsCache::prepare`]: a present cache entry is
 //! trusted as-is — the registry is never contacted — and the freshness
@@ -21,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
 
-use crate::cache::{extract_prepared, oci_freshness_changed, EntryLock, RootfsCache};
+use crate::cache::{oci_freshness_changed, EntryLock, RootfsCache};
 use crate::distro::{resolve_source, ImageSource};
 use crate::download::download_image;
 use crate::error::Error;
@@ -40,10 +46,10 @@ pub struct Pulled {
 }
 
 impl RootfsCache {
-    /// Resolve `req`, download through the cache when needed, and extract
-    /// into a fresh scratch directory (removed when the returned
-    /// [`PreparedRootfs`] is dropped).  Download and extraction progress is
-    /// reported through `progress`.
+    /// Resolve `req`, download through the cache when needed, and copy
+    /// the entry image into a fresh scratch directory (removed when the
+    /// returned [`PreparedRootfs`] is dropped). Download and image-build
+    /// progress is reported through `progress`.
     ///
     /// This is the boot path, not the freshness path: a present entry
     /// is trusted as-is and the registry is never contacted — the
@@ -51,27 +57,70 @@ impl RootfsCache {
     /// pulls by default, because there is nothing to boot otherwise.
     pub fn prepare(&self, req: &PrepareRequest, progress: &dyn Progress) -> Result<PreparedRootfs> {
         let (source, cache_path, _) = self.ensure_entry(req, progress, false)?;
-        // A local archive bypasses the cache: the file is the source
-        // on every run (--no-cache has nothing to say about it), and
-        // the derived entry name only matters for diagnostics.
-        if let ImageSource::LocalTarball { path } = &source {
-            return extract_prepared(path, progress).map_err(Error::Other);
+        let scratch = tempfile::tempdir().context("Failed to create temporary directory")?;
+        let image = scratch.path().join("rootfs.img");
+        match &source {
+            // A local archive bypasses the cache: the file is the
+            // source on every run (--no-cache has nothing to say about
+            // it), and the derived entry name only matters for
+            // diagnostics.
+            ImageSource::LocalTarball { path } => {
+                crate::image::build_rootfs_image(path, &image, progress)?;
+            }
+            _ => {
+                let entry_image = cache_path.with_extension("img");
+                self.ensure_image(&cache_path, &entry_image, progress)?;
+                crate::image::copy_image(&entry_image, &image)?;
+            }
         }
-        Ok(extract_prepared(&cache_path, progress)?)
+        Ok(PreparedRootfs { scratch })
     }
 
-    /// Fetch or refresh the image's cache entry without extracting it:
-    /// resolve the reference, re-check unpinned OCI tags against the
+    /// Fetch or refresh the cache entry without booting it: resolve
+    /// the reference, re-check unpinned OCI tags against the
     /// registry digest, re-resolve floating distro aliases, and
     /// download only when the entry is absent or has moved.  The
     /// explicit freshness operation — `prepare` (and so `run`) boots
     /// the local entry untouched.
     pub fn pull(&self, req: &PrepareRequest, progress: &dyn Progress) -> Result<Pulled> {
         let (_, cache_path, downloaded) = self.ensure_entry(req, progress, true)?;
+        // The image is the deliverable: pull leaves the entry ready to
+        // boot, so a run pays for a copy, never for a build.
+        let entry_image = cache_path.with_extension("img");
+        self.ensure_image(&cache_path, &entry_image, progress)?;
         Ok(Pulled {
             cache_path,
             downloaded,
         })
+    }
+
+    /// The entry's image, built from the entry tarball when absent or
+    /// older than the tarball. Runs copy the image; the tarball is the
+    /// build input only. One writer per entry, like the download path.
+    fn ensure_image(&self, tarball: &Path, image: &Path, progress: &dyn Progress) -> Result<()> {
+        let mtime = |p: &Path| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        };
+        let fresh = || image.exists() && mtime(image) >= mtime(tarball);
+        if fresh() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("Failed to create cache directory {}", self.dir.display()))?;
+        let _entry_lock = EntryLock::acquire(image, progress).map_err(Error::Other)?;
+        // Re-derive freshness under the lock: a competing run may have
+        // built the image while we waited.
+        if fresh() {
+            log::debug!(
+                "another run built {} while we waited; using it",
+                image.display()
+            );
+            return Ok(());
+        }
+        crate::image::build_rootfs_image(tarball, image, progress)?;
+        Ok(())
     }
 
     /// The shared spine of `prepare` and `pull`: resolve the request
@@ -190,18 +239,32 @@ impl PrepareRequest {
     }
 }
 
-/// A rootfs extracted into a scratch directory, ready for
-/// [`crate::vm::run`] to boot. The directory is removed when this
-/// value is dropped.
+/// A rootfs image copied into a scratch directory, ready for
+/// [`crate::vm::run`] to boot. The scratch directory is removed when
+/// this value is dropped.
 #[derive(Debug)]
 pub struct PreparedRootfs {
-    pub(crate) rootfs: TempDir,
+    pub(crate) scratch: TempDir,
 }
 
 impl PreparedRootfs {
-    /// The extracted rootfs directory.
+    /// The run's scratch directory: the image copy lives here, next to
+    /// the console capture and the files waiting to be provisioned in.
     pub fn dir(&self) -> &Path {
-        self.rootfs.path()
+        self.scratch.path()
+    }
+
+    /// The image copy the machine boots.
+    pub(crate) fn image(&self) -> PathBuf {
+        self.scratch.path().join("rootfs.img")
+    }
+
+    /// Per-run surgery on the image copy: the generated init at its
+    /// fixed guest path, the host resolver over whatever the image
+    /// shipped, a stale control file removed. debugfs does it; nothing
+    /// mounts.
+    pub(crate) fn provision(&self, unlinks: &[&str], files: &[(&Path, &str, u32)]) -> Result<()> {
+        crate::image::provision(&self.image(), unlinks, files).map_err(Error::Other)
     }
 }
 
@@ -209,6 +272,13 @@ impl PreparedRootfs {
 mod tests {
     use super::*;
     use crate::progress::NoProgress;
+
+    fn have_e2fsprogs() -> bool {
+        std::process::Command::new("mkfs.ext4")
+            .arg("-V")
+            .output()
+            .is_ok()
+    }
 
     #[test]
     fn pull_rejects_local_archives() {
@@ -220,6 +290,10 @@ mod tests {
 
     #[test]
     fn pull_on_a_cached_entry_reports_no_download() {
+        if !have_e2fsprogs() {
+            eprintln!("SKIP: no e2fsprogs");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let cache = RootfsCache::new(dir.path().to_path_buf());
         let pinned = crate::distro::parse_image_ref(
@@ -229,7 +303,18 @@ mod tests {
         .unwrap();
         let entry = cache.tarball_path(&pinned, "amd64");
         std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
-        std::fs::write(&entry, b"x").unwrap();
+        // A real (tiny) rootfs tarball: the entry is trusted, but pull
+        // still owes the cache its bootable image, built from it.
+        let file = std::fs::File::create(&entry).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut tar = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_mode(0o755);
+        tar.append_data(&mut header, "etc", std::io::empty())
+            .unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
 
         let req = PrepareRequest::new(
             "ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -237,6 +322,17 @@ mod tests {
         let pulled = cache.pull(&req, &NoProgress).unwrap();
         assert!(!pulled.downloaded);
         assert_eq!(pulled.cache_path, entry);
+        // The image is the deliverable: pull leaves it next to the
+        // tarball, and a second pull rebuilds nothing.
+        let image = entry.with_extension("img");
+        assert!(image.exists());
+        let before = std::fs::metadata(&image).unwrap().modified().unwrap();
+        let pulled = cache.pull(&req, &NoProgress).unwrap();
+        assert!(!pulled.downloaded);
+        assert_eq!(
+            std::fs::metadata(&image).unwrap().modified().unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -277,12 +373,16 @@ mod tests {
 
     #[test]
     fn a_local_archive_prepares_without_touching_the_cache() {
+        if !have_e2fsprogs() {
+            eprintln!("SKIP: no e2fsprogs");
+            return;
+        }
         // A rootfs tree, packed next to itself as ./rootfs.tar.gz, the
         // way a caller names a local archive.
         let work = tempfile::tempdir().unwrap();
         let tree = work.path().join("tree");
         std::fs::create_dir_all(&tree).unwrap();
-        std::fs::write(tree.join("etc-marker"), b"local").unwrap();
+        std::fs::write(tree.join("etc-marker"), b"local\n").unwrap();
         let tarball = work.path().join("rootfs.tar.gz");
         let file = std::fs::File::create(&tarball).unwrap();
         let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
@@ -296,10 +396,17 @@ mod tests {
         // process's working directory, not the tempdir.
         let req = PrepareRequest::new(tarball.to_str().unwrap());
         let rootfs = cache.prepare(&req, &NoProgress).expect("prepares");
-        assert_eq!(
-            std::fs::read(rootfs.dir().join("etc-marker")).unwrap(),
-            b"local"
-        );
+        // The scratch holds a bootable image carrying the tree, not a
+        // tree itself: the marker is read back out of the image.
+        let image = rootfs.dir().join("rootfs.img");
+        assert!(image.exists());
+        let out = std::process::Command::new("debugfs")
+            .arg("-R")
+            .arg("cat /etc-marker")
+            .arg(&image)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "local\n");
         // Nothing was downloaded or stashed: the file is the source.
         assert!(cache_dir.path().read_dir().unwrap().next().is_none());
     }

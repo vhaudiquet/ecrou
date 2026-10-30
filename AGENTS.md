@@ -38,10 +38,12 @@ Rules:
     (`crates/ecrou/src/rootfs.rs`)
   - `cache` - the rootfs entry store: naming, locking, freshness,
     layer pointers (`crates/ecrou/src/cache.rs`)
-  - `pack` - rootfs tarball packing (`crates/ecrou/src/pack.rs`)
+  - `image` - ext4 image building and inspection
+    (`crates/ecrou/src/image.rs`)
   - `distro` - distro definitions and mirrors (`crates/ecrou/src/distro.rs`)
   - `download` - image download (`crates/ecrou/src/download.rs`)
-  - `extract` - rootfs extraction (`crates/ecrou/src/extract.rs`)
+  - `extract` - tar decoding and the OCI layer merge feeding the image
+    build (`crates/ecrou/src/extract.rs`)
   - `registry` - OCI registry client (`crates/ecrou/src/registry.rs`)
   - `utils`, `error`, `progress` - shared helpers
   - `deps` - dependency additions/bumps (manifests, lockfile)

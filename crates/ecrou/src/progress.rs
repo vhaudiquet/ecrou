@@ -1,8 +1,8 @@
 //! Progress reporting for long-running operations.
 //!
-//! The library never touches the terminal: downloads, extraction and
-//! initramfs creation report their progress through the [`Progress`]
-//! sink supplied by the caller.  Consumers choose what to render —
+//! The library never touches the terminal: downloads and image builds
+//! report their progress through the [`Progress`] sink supplied by the
+//! caller.  Consumers choose what to render —
 //! progress bars, spinners, structured events — or pass [`NoProgress`]
 //! for silence.
 
@@ -11,7 +11,7 @@
 pub enum Unit {
     /// Bytes transferred (downloads).
     Bytes,
-    /// Files processed (extraction, archive creation).
+    /// Files processed (archive merges, the image build).
     Files,
 }
 

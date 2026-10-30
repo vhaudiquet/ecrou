@@ -209,11 +209,11 @@ pub(crate) fn kill_machine(child: libc::pid_t) {
 pub(crate) fn wait_machine(
     child: libc::pid_t,
     reaped: &std::sync::atomic::AtomicI32,
-    exit_file_host: &Path,
+    read_exit: &dyn Fn() -> Option<String>,
 ) -> Result<i32> {
     let reaped_status = reaped.load(std::sync::atomic::Ordering::SeqCst);
     if reaped_status >= 0 {
-        return decode_status(reaped_status, exit_file_host);
+        return decode_status(reaped_status, read_exit);
     }
     let mut status: libc::c_int = 0;
     // Safety: waitpid on our own child; the pointer points at valid
@@ -233,17 +233,18 @@ pub(crate) fn wait_machine(
                 .context("waiting for the machine process"),
         ));
     }
-    decode_status(status, exit_file_host)
+    decode_status(status, read_exit)
 }
 
 /// Translate the machine child's raw wait status into the result of a
-/// run. Only the guest init can mint a guest exit code: it reports the
-/// payload's code through the control file and the VMM exits the child
-/// with it. Everything else is ecrou's own machinery talking, and is
-/// an error, never a code — the shell's 128+n convention would
-/// otherwise masquerade a SIGKILLed or OOM-killed VMM as the payload
-/// having died by that signal.
-fn decode_status(status: libc::c_int, exit_file_host: &Path) -> Result<i32> {
+/// run. Only the guest init can mint a guest exit code, and it does so
+/// through the control file, which outranks the child's own exit code:
+/// with a block root the engine's exit-code channel (an ioctl through
+/// the virtiofs root device) never fires, so the child's code is
+/// machinery talk. Everything else is an error, never a code — the
+/// shell's 128+n convention would otherwise masquerade a SIGKILLed or
+/// OOM-killed VMM as the payload having died by that signal.
+fn decode_status(status: libc::c_int, read_exit: &dyn Fn() -> Option<String>) -> Result<i32> {
     use std::os::unix::process::ExitStatusExt;
     let status = std::process::ExitStatus::from_raw(status);
     if let Some(sig) = status.signal() {
@@ -256,18 +257,20 @@ fn decode_status(status: libc::c_int, exit_file_host: &Path) -> Result<i32> {
         )));
     }
     let code = status.code().unwrap_or(125);
+    // The init writes the payload's code before it exits; a file that
+    // parses is the run's answer, whatever the child said.
+    if let Some(s) = read_exit() {
+        if let Ok(c) = s.trim().parse::<i32>() {
+            return Ok(c);
+        }
+    }
     match code {
         // Reserved by the machinery itself: 125 is the child's bail
         // code (boot failure), 126 is the init refusing to run the
-        // payload (a share that would not mount, a missing workdir). A
-        // payload that genuinely exits either code reported through
-        // the control file first — the file is the arbiter.
+        // payload (a share that would not mount, a missing workdir).
+        // Nothing reported through the control file, so these are
+        // exactly what they say.
         125 | 126 => {
-            if let Ok(s) = std::fs::read_to_string(exit_file_host) {
-                if let Ok(c) = s.trim().parse::<i32>() {
-                    return Ok(c);
-                }
-            }
             let cause = if code == 125 {
                 "the machine failed to boot"
             } else {
@@ -304,7 +307,10 @@ mod tests {
             signaled(libc::SIGKILL),
             signaled(libc::SIGTERM),
         ] {
-            let err = decode_status(raw, &dir.path().join("absent")).unwrap_err();
+            let err = decode_status(raw, &|| {
+                std::fs::read_to_string(dir.path().join("absent")).ok()
+            })
+            .unwrap_err();
             assert!(
                 err.to_string().contains("engine or hypervisor failure"),
                 "{err}"
@@ -316,36 +322,36 @@ mod tests {
     fn a_boot_failure_is_an_error_and_a_payload_code_is_not() {
         let dir = tempfile::tempdir().unwrap();
         let exit_file = dir.path().join(".ecrou-exit");
+        let read = || std::fs::read_to_string(&exit_file).ok();
         // 125 with no report: the child's bail code.
-        let err = decode_status(exited(125), &exit_file).unwrap_err();
+        let err = decode_status(exited(125), &read).unwrap_err();
         assert!(err.to_string().contains("failed to boot"), "{err}");
         // 126 with no report: the init refused (share, workdir).
-        let err = decode_status(exited(126), &exit_file).unwrap_err();
+        let err = decode_status(exited(126), &read).unwrap_err();
         assert!(err.to_string().contains("share failed to mount"), "{err}");
         // A payload that genuinely exited a reserved code reported
         // through the control file first.
         std::fs::write(&exit_file, "7").unwrap();
-        assert_eq!(decode_status(exited(125), &exit_file).unwrap(), 7);
+        assert_eq!(decode_status(exited(125), &read).unwrap(), 7);
         std::fs::write(&exit_file, "3").unwrap();
-        assert_eq!(decode_status(exited(126), &exit_file).unwrap(), 3);
+        assert_eq!(decode_status(exited(126), &read).unwrap(), 3);
     }
 
     #[test]
-    fn an_ordinary_code_needs_no_control_file() {
+    fn the_control_file_outranks_the_childs_code() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(
-            decode_status(exited(42), &dir.path().join("absent")).unwrap(),
-            42
-        );
-        assert_eq!(
-            decode_status(exited(0), &dir.path().join("absent")).unwrap(),
-            0
-        );
-        // A garbage control file does not turn a normal code into an
-        // error either — the code came through the VMM's own exit.
         let exit_file = dir.path().join(".ecrou-exit");
+        // The usual block-root run: the payload exited 42, the engine
+        // had no channel, the child says 0. The file wins.
+        std::fs::write(&exit_file, "42").unwrap();
+        let read = || std::fs::read_to_string(&exit_file).ok();
+        assert_eq!(decode_status(exited(0), &read).unwrap(), 42);
+        // A file that does not parse falls through to the child's code.
         std::fs::write(&exit_file, "not a number").unwrap();
-        assert_eq!(decode_status(exited(42), &exit_file).unwrap(), 42);
+        assert_eq!(decode_status(exited(42), &read).unwrap(), 42);
+        // An absent file too.
+        assert_eq!(decode_status(exited(42), &|| None::<String>).unwrap(), 42);
+        assert_eq!(decode_status(exited(0), &|| None::<String>).unwrap(), 0);
     }
 
     #[test]

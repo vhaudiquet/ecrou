@@ -30,13 +30,17 @@ const LOAD_REMEDIATION: &str = "install libkrun, or point LD_LIBRARY_PATH \
 at the directory holding it (a snap stages it next to the binary)";
 
 macro_rules! symbol {
-    ($lib:expr, $name:expr, $ty:ty) => {{
+    ($lib:expr, $name:expr, $ty:ty) => {
+        symbol!($lib, $name, $ty, "libkrun too old?")
+    };
+    ($lib:expr, $name:expr, $ty:ty, $hint:expr) => {{
         // Safety: the symbol is used through the library handle with the
         // signature from libkrun.h written at the call site.
         unsafe { $lib.get::<$ty>($name) }.with_context(|| {
             format!(
-                "symbol {} missing: libkrun too old?",
-                String::from_utf8_lossy($name)
+                "symbol {} missing: {}",
+                String::from_utf8_lossy($name),
+                $hint
             )
         })?
     }};
@@ -123,6 +127,57 @@ impl Krun {
         );
         // Safety: root_c is NUL-terminated and outlives the call.
         krun_ret(unsafe { f(ctx_id, root_c.as_ptr()) }, "krun_set_root")
+    }
+
+    /// `krun_add_disk`: a raw image as a virtio-blk device. An engine
+    /// built without the blk feature ships no such symbol, and the
+    /// lookup failure names that, not age.
+    pub fn add_disk(
+        &self,
+        ctx_id: u32,
+        block_id: &str,
+        path: &Path,
+        read_only: bool,
+    ) -> Result<()> {
+        let block_c = CString::new(block_id).context("block id contains a NUL")?;
+        let path_c = path_cstring(path)?;
+        let f = symbol!(
+            self.lib,
+            b"krun_add_disk\0",
+            unsafe extern "C" fn(u32, *const c_char, *const c_char, bool) -> i32,
+            "the engine was built without the blk feature, so it ships no block devices"
+        );
+        // Safety: both CStrings are NUL-terminated and outlive the call.
+        krun_ret(
+            unsafe { f(ctx_id, block_c.as_ptr(), path_c.as_ptr(), read_only) },
+            "krun_add_disk",
+        )
+    }
+
+    /// `krun_set_root_disk_remount`: which block device the init blob
+    /// mounts as `/` and chroots into. A disk must have been added
+    /// first; the mount options stay at their defaults.
+    pub fn set_root_disk_remount(&self, ctx_id: u32, device: &str, fstype: &str) -> Result<()> {
+        let device_c = CString::new(device).context("device contains a NUL")?;
+        let fstype_c = CString::new(fstype).context("fstype contains a NUL")?;
+        let f = symbol!(
+            self.lib,
+            b"krun_set_root_disk_remount\0",
+            unsafe extern "C" fn(u32, *const c_char, *const c_char, *const c_char) -> i32,
+            "the engine was built without the blk feature, so it ships no block devices"
+        );
+        // Safety: the CStrings are NUL-terminated and outlive the call.
+        krun_ret(
+            unsafe {
+                f(
+                    ctx_id,
+                    device_c.as_ptr(),
+                    fstype_c.as_ptr(),
+                    std::ptr::null(),
+                )
+            },
+            "krun_set_root_disk_remount",
+        )
     }
 
     /// `krun_add_virtiofs`: an extra tagged share, mounted guest-side.

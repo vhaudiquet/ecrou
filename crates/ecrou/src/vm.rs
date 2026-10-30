@@ -8,7 +8,7 @@
 //! the control file read back for the exit code. The VMM runs inside
 //! this process, so a kill of the process is a kill of the machine (T4).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Context};
 
@@ -158,18 +158,24 @@ pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32
         })
         .transpose()
         .map_err(Error::Other)?;
-    let share_pairs = collect_shares(rootfs.dir(), options, capture_share).map_err(Error::Other)?;
+    let state = rootfs.dir().to_path_buf();
+    let image = rootfs.image();
+    let share_pairs = collect_shares(&state, options, capture_share).map_err(Error::Other)?;
     let shares = share_pairs
         .iter()
         .map(|(_, gs)| gs.clone())
         .collect::<Vec<_>>();
-    let payload = payload_command(options, rootfs.dir());
-    let env = compose_env(rootfs.dir(), options, &hostname);
+    // The shell the image ships, probed in the image: with no
+    // extracted tree, detection is a debugfs stat, not a file check.
+    let shell = crate::image::detect_shell(&image).map_err(Error::Other)?;
+    let payload = payload_command(options, shell);
+    let env = compose_env(shell, options, &hostname);
 
     // The guest init is generated for every run: it is the exit-code
     // contract (it writes the control file), the share mounter, and the
-    // hostname applier.
-    let init_path = rootfs.dir().join("ecrou-init");
+    // hostname applier. It lands inside the image, at the fixed path
+    // the init blob execs, through debugfs.
+    let init_path = state.join("ecrou-init");
     let capture = options.capture.as_ref().map(|_| guest::GuestCapture {
         stdout: guest::CAPTURE_STDOUT.to_string(),
         stderr: guest::CAPTURE_STDERR.to_string(),
@@ -192,14 +198,24 @@ pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32
     );
     std::fs::write(&init_path, script)
         .with_context(|| format!("writing {}", init_path.display()))?;
-    set_exec_bit(&init_path)?;
 
-    let exit_file_host = rootfs.dir().join(
-        guest::EXIT_FILE
-            .strip_prefix('/')
-            .expect("EXIT_FILE is absolute at the guest root"),
-    );
-    let _ = std::fs::remove_file(&exit_file_host);
+    // Per-run surgery on the image copy: the init at its fixed guest
+    // path, the host resolver over whatever the image shipped, and a
+    // stale control file dropped. The unlink set is defensive: a
+    // tarball can ship a /.ecrou-exit, and resolver-bearing images
+    // ship /etc/resolv.conf as a symlink, which must go before the
+    // regular file lands.
+    let mut unlinks = vec![guest::EXIT_FILE];
+    let mut provisioned: Vec<(&std::path::Path, &str, u32)> =
+        vec![(&init_path, "/ecrou-init", 0o755)];
+    let host_resolv = state.join("resolv.conf");
+    if let Some(resolv) = crate::cache::host_resolver_content() {
+        std::fs::write(&host_resolv, resolv)
+            .with_context(|| format!("writing {}", host_resolv.display()))?;
+        unlinks.push("/etc/resolv.conf");
+        provisioned.push((&host_resolv, "/etc/resolv.conf", 0o644));
+    }
+    rootfs.provision(&unlinks, &provisioned)?;
 
     krun.set_log_level(match options.log_level {
         LogLevel::Quiet => 0,   // off
@@ -208,7 +224,12 @@ pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32
     })?;
     let ctx = krun.create_ctx()?;
     krun.set_vm_config(ctx, vcpus, ram_mib)?;
-    krun.set_root(ctx, rootfs.dir())?;
+    // The rootfs crosses as a virtio-blk disk: the init blob mounts
+    // /dev/vda at /newroot, chroots, and execs the payload path from
+    // there. No virtiofs root, no set_root; the workspace and any
+    // named shares ride virtiofs as before.
+    krun.add_disk(ctx, "root", &image, false)?;
+    krun.set_root_disk_remount(ctx, "/dev/vda", "ext4")?;
     for (share, gs) in &share_pairs {
         krun.add_virtiofs(ctx, &gs.tag, &share.host)?;
     }
@@ -237,7 +258,7 @@ pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32
     // process's own stdin and stdout (raw mode and its restore are
     // libkrun's on a tty; pipe streams surface as virtio ports the
     // init wires). A killed parent kills the machine through PDEATHSIG.
-    let console_path = rootfs.dir().join(".ecrou-console");
+    let console_path = state.join(".ecrou-console");
     if !interactive {
         std::fs::File::create(&console_path)
             .with_context(|| format!("creating {}", console_path.display()))?;
@@ -256,16 +277,18 @@ pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32
     // normal payload exit ends the child through the VMM's own exit).
     let child = crate::supervise::spawn_machine(&krun, ctx, &console_path, interactive)?;
 
+    // The control file lives inside the image now; the arbitration
+    // read is a debugfs cat after the machine has exited.
+    let read_exit = {
+        let image = image.clone();
+        move || crate::image::read_file(&image, guest::EXIT_FILE).ok()
+    };
     let result = if interactive {
-        crate::supervise::wait_machine(
-            child,
-            &std::sync::atomic::AtomicI32::new(-1),
-            &exit_file_host,
-        )
+        crate::supervise::wait_machine(child, &std::sync::atomic::AtomicI32::new(-1), &read_exit)
     } else {
         let reaped = std::sync::atomic::AtomicI32::new(-1);
         crate::supervise::stream_console(&console_path, child, &reaped)
-            .and_then(|()| crate::supervise::wait_machine(child, &reaped, &exit_file_host))
+            .and_then(|()| crate::supervise::wait_machine(child, &reaped, &read_exit))
     };
     // A parent-side failure (a console stat or read that went wrong, a
     // wait that could not complete) must not leave the machine booting
@@ -361,8 +384,8 @@ fn reject_reserved_namespace(target: &str) -> anyhow::Result<()> {
 }
 
 /// The guest payload: the caller's argv, or the rootfs's default shell.
-fn payload_command(options: &RunOptions, rootfs_dir: &Path) -> Vec<String> {
-    let shell = utils::detect_shell(rootfs_dir).to_string();
+fn payload_command(options: &RunOptions, shell: &str) -> Vec<String> {
+    let shell = shell.to_string();
     match options.command.as_slice() {
         // No command: the image's shell.
         [] => vec![shell],
@@ -380,15 +403,12 @@ fn payload_command(options: &RunOptions, rootfs_dir: &Path) -> Vec<String> {
 /// The guest environment, composed from scratch: a usable base, the
 /// workspace mount point, and the caller's pairs. Never the host
 /// environment.
-fn compose_env(rootfs_dir: &Path, options: &RunOptions, hostname: &str) -> Vec<(String, String)> {
+fn compose_env(shell: &str, options: &RunOptions, hostname: &str) -> Vec<(String, String)> {
     let host_term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
     let mut env = vec![
         ("HOME".to_string(), "/root".to_string()),
         ("USER".to_string(), "root".to_string()),
-        (
-            "SHELL".to_string(),
-            utils::detect_shell(rootfs_dir).to_string(),
-        ),
+        ("SHELL".to_string(), shell.to_string()),
         ("TERM".to_string(), host_term),
         ("HOSTNAME".to_string(), hostname.to_string()),
         (
@@ -403,15 +423,6 @@ fn compose_env(rootfs_dir: &Path, options: &RunOptions, hostname: &str) -> Vec<(
         env.push((k.clone(), v.clone()));
     }
     env
-}
-
-fn set_exec_bit(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?
-        .permissions();
-    perms.set_mode(perms.mode() | 0o755);
-    std::fs::set_permissions(path, perms).with_context(|| format!("chmod +x {}", path.display()))
 }
 
 /// libkrun wants a vcpu count; all logical cpus is the sensible default
@@ -455,14 +466,6 @@ fn parse_memory_mib(s: &str) -> anyhow::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A scratch with just a shell, for payload_command tests.
-    fn shell_rootfs() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
-        std::fs::write(dir.path().join("bin/sh"), "").unwrap();
-        dir
-    }
 
     #[test]
     fn caller_shares_cannot_take_the_reserved_namespace() {
@@ -529,23 +532,26 @@ mod tests {
 
     #[test]
     fn payload_defaults_to_the_image_shell() {
-        let rootfs = shell_rootfs();
         let options = RunOptions::default();
         assert_eq!(
-            payload_command(&options, rootfs.path()),
+            payload_command(&options, "/bin/sh"),
             vec!["/bin/sh".to_string()]
+        );
+        // Whatever the probe found stands in verbatim.
+        assert_eq!(
+            payload_command(&options, "/bin/bash"),
+            vec!["/bin/bash".to_string()]
         );
     }
 
     #[test]
     fn payload_argv_is_taken_literally() {
-        let rootfs = shell_rootfs();
         let options = RunOptions {
             command: vec!["uname".to_string(), "-a".to_string()],
             ..RunOptions::default()
         };
         assert_eq!(
-            payload_command(&options, rootfs.path()),
+            payload_command(&options, "/bin/sh"),
             vec!["uname".to_string(), "-a".to_string()]
         );
         // Even when it looks like a shell invocation: the consumer
@@ -555,20 +561,19 @@ mod tests {
             ..RunOptions::default()
         };
         assert_eq!(
-            payload_command(&options, rootfs.path()),
+            payload_command(&options, "/bin/sh"),
             vec!["sh".to_string(), "-c".to_string(), "exit 7".to_string()]
         );
     }
 
     #[test]
     fn payload_single_quoted_line_runs_through_the_shell() {
-        let rootfs = shell_rootfs();
         let options = RunOptions {
             command: vec!["apk add fastfetch && fastfetch".to_string()],
             ..RunOptions::default()
         };
         assert_eq!(
-            payload_command(&options, rootfs.path()),
+            payload_command(&options, "/bin/sh"),
             vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
@@ -610,12 +615,11 @@ mod tests {
     fn compose_env_never_inherits_the_host() {
         // compose_env reads the host TERM and nothing else from the
         // process environment.
-        let dir = std::env::temp_dir();
         let mut options = RunOptions::default();
         options
             .env
             .push(("ECROU_TEST_MARK".to_string(), "present".to_string()));
-        let env = compose_env(&dir, &options, "ecrou-vm-x");
+        let env = compose_env("/bin/sh", &options, "ecrou-vm-x");
         assert!(env
             .iter()
             .any(|(k, v)| k == "ECROU_TEST_MARK" && v == "present"));

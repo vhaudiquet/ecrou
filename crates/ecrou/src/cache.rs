@@ -13,10 +13,8 @@ use anyhow::{anyhow, Context};
 
 use crate::distro::{map_arch, Distro, ImageSource};
 use crate::download::digest_sidecar;
-use crate::extract::extract_tarball;
 use crate::progress::Progress;
 use crate::registry::fetch_oci_digest;
-use crate::rootfs::PreparedRootfs;
 use crate::Result;
 
 /// Whether an OCI image with a floating tag (":latest") has moved since
@@ -135,66 +133,37 @@ impl RootfsCache {
     }
 }
 
-pub(crate) fn extract_prepared(
-    source: &Path,
-    progress: &dyn Progress,
-) -> anyhow::Result<PreparedRootfs> {
-    let temp = tempfile::tempdir().context("Failed to create temporary directory")?;
-    let rootfs = temp.path().to_path_buf();
-
-    log::debug!("Extracting to: {}", rootfs.display());
-    extract_tarball(source, &rootfs, progress)?;
-    provision_resolver(&rootfs);
-
-    Ok(PreparedRootfs { rootfs: temp })
-}
-
-/// Give the guest the host's resolver: the engine proxies guest
-/// sockets to the host's stack, so a nameserver line that works on the
-/// host works in the machine, loopback stub included. Without it the
-/// guest has whatever the image shipped, which is usually nothing.
-/// Best effort: a rootfs with its own resolver config keeps it.
-fn provision_resolver(rootfs: &Path) {
-    // The engine proxies guest sockets to the host's stack, so any
-    // host-reachable nameserver works in the machine - but loopback
-    // addresses do not cross: 127.0.0.53 stays inside the guest, where
-    // nothing listens. So the source of truth is systemd-resolved's
-    // uplink config when present, and loopback nameservers are dropped
-    // from whatever is copied. Best effort: failures leave the
-    // image's file.
-    let host = match std::fs::read_to_string("/run/systemd/resolve/resolv.conf")
+/// The host resolver config, ready to provision into the machine: the
+/// engine proxies guest sockets to the host's stack, so a nameserver
+/// line that works on the host works in the machine, loopback stub
+/// included. Without it the guest has whatever the image shipped,
+/// which is usually nothing. Best effort: None leaves the image's own
+/// file standing.
+pub(crate) fn host_resolver_content() -> Option<String> {
+    // Loopback addresses do not cross: 127.0.0.53 stays inside the
+    // guest, where nothing listens. The source of truth is
+    // systemd-resolved's uplink config when present, and loopback
+    // nameservers are dropped from whatever is copied.
+    match std::fs::read_to_string("/run/systemd/resolve/resolv.conf")
         .or_else(|_| std::fs::read_to_string("/etc/resolv.conf"))
     {
-        Ok(s) if !s.trim().is_empty() => drop_loopback_nameservers(&s),
+        Ok(s) if !s.trim().is_empty() => {
+            let content = drop_loopback_nameservers(&s);
+            if content.contains("nameserver ") {
+                Some(content)
+            } else {
+                log::debug!("host resolver config has no usable nameserver; leaving the image's");
+                None
+            }
+        }
         Ok(_) => {
             log::debug!("host resolver config is empty; leaving the image's in place");
-            return;
+            None
         }
         Err(e) => {
-            log::debug!(
-                "no host resolver config ({}); leaving the image's in place",
-                e
-            );
-            return;
+            log::debug!("no host resolver config ({e}); leaving the image's in place");
+            None
         }
-    };
-    if !host.contains("nameserver ") {
-        log::debug!("host resolver config has no usable nameserver; leaving the image's");
-        return;
-    }
-    let target = rootfs.join("etc/resolv.conf");
-    if let Err(e) = std::fs::remove_file(&target) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            log::debug!("could not clear {}: {}", target.display(), e);
-            return;
-        }
-    }
-    if let Some(parent) = target.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    match std::fs::write(&target, host) {
-        Ok(()) => log::debug!("provisioned a resolver into {}", target.display()),
-        Err(e) => log::debug!("could not write {}: {}", target.display(), e),
     }
 }
 
@@ -334,9 +303,6 @@ mod tests {
             PathBuf::from("/cache/oci-docker_io-library_ubuntu-latest-amd64.tar.gz")
         );
     }
-
-    /// Build a minimal rootfs tree with a nested executable and a symlink,
-    /// pack it, and extract it back through the public extract_tarball path.
 
     #[test]
     fn a_digest_pin_names_its_own_cache_entry() {

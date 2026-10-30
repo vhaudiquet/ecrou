@@ -523,7 +523,8 @@ fn download_blob_with_auth(
 }
 
 /// Map an OCI layer mediaType to the appropriate file extension.
-/// The extension is stored in layers.manifest and used by extract_oci_layer
+/// The extension is stored in layers.manifest and read back by the
+/// OCI merge in [`crate::extract`]
 /// for compression dispatch, so it must accurately reflect the blob encoding.
 fn media_type_to_extension(media_type: &str) -> &'static str {
     match media_type {

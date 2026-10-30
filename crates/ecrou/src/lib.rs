@@ -2,11 +2,11 @@
 //!
 //! This crate is the library behind the `ecrou` CLI. It resolves distro
 //! and OCI image references, downloads them through a content cache,
-//! extracts the rootfs into a scratch directory, and boots it as a
-//! one-shot microVM: one command runs as the machine's only workload,
-//! its stdio streams through, its exit code comes back, and the machine
-//! is thrown away. The rootfs crosses as a virtiofs share, the workspace
-//! as explicit shares the consumer names.
+//! builds the ext4 image the machine boots, and runs it as a one-shot
+//! microVM: one command runs as the machine's only workload, its stdio
+//! streams through, its exit code comes back, and the machine is thrown
+//! away. The rootfs crosses as a raw image on a virtio-blk disk, the
+//! workspace as explicit virtiofs shares the consumer names.
 //!
 //! The founding rule: the host process never mounts a filesystem and
 //! never enters a namespace. Every boundary crossing is a file or a
@@ -35,8 +35,9 @@ pub mod cache;
 pub mod distro;
 pub mod download;
 pub mod error;
-pub mod extract;
+mod extract;
 pub mod guest;
+mod image;
 pub mod krun;
 pub mod progress;
 mod registry;
