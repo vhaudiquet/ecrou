@@ -279,13 +279,10 @@ build is deleted.
   correct-and-slow v1 posture graduates into this.
 - **Guest agent, long-lived machines.** Exec without a boot; the shape
   to grow into when per-command VMs stop being right.
-- **Provisioned layers, keyed.** `provision` today bakes one entry
-  per image; the next step keys entries by (base digest, hash of the
-  provisioning spec) so consumers each get their own layer over a
-  shared base, the spec file living in the repo and the artifact
-  reproducible from it. Marker-hit semantics then skip the command
-  only for the identical spec, and eviction (LRU or an explicit
-  prune) keeps derived entries bounded.
+- **Layer eviction.** Provisioned layers are already keyed: a spec
+  file (base, packages, run) hashed with its base reference, named by
+  `--layer` for `run --layer`. Nothing prunes the derived entries yet;
+  eviction (LRU or an explicit prune) keeps them bounded.
 - **passt** (`krun_set_passt_fd`) if TSI throughput or UDP listening
   ever matters.
 - **An agent in the guest** over port publishing: an http backend
