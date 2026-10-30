@@ -172,7 +172,7 @@ pub(crate) fn provision(
     unlinks: &[&str],
     files: &[(&Path, &str, u32)],
 ) -> anyhow::Result<()> {
-    if files.is_empty() {
+    if files.is_empty() && unlinks.is_empty() {
         return Ok(());
     }
     let cmds = image.with_extension("provision");
@@ -238,9 +238,8 @@ pub(crate) fn stat_exists(image: &Path, guest: &str) -> anyhow::Result<bool> {
     Ok(String::from_utf8_lossy(&out.stdout).contains("Inode:"))
 }
 
-/// Which shell the image ships, probed in the image. The order mirrors
-/// `utils::detect_shell` over an extracted tree, which the image build
-/// replaced; the fallback is the same, and fails in the guest with a
+/// Which shell the image ships, probed in the image: bash before sh,
+/// /bin before /usr/bin. The final fallback fails in the guest with a
 /// clear exec error if the image ships no shell at all.
 pub(crate) fn detect_shell(image: &Path) -> anyhow::Result<&'static str> {
     for shell in ["/bin/bash", "/bin/sh", "/usr/bin/bash", "/usr/bin/sh"] {
@@ -402,6 +401,26 @@ mod tests {
             .unwrap();
         let stat = String::from_utf8_lossy(&out.stdout);
         assert!(stat.contains("Mode:  0755"), "{stat}");
+    }
+
+    #[test]
+    fn unlinks_run_without_files() {
+        if !have_e2fsprogs() {
+            eprintln!("SKIP: no e2fsprogs");
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let tarball = work.path().join("rootfs.tar");
+        fixture(&tarball);
+        let image = work.path().join("rootfs.img");
+        build(&tarball, &image);
+        assert!(stat_exists(&image, "/etc/marker").unwrap());
+
+        // No files staged: the unlink set still runs. This is the
+        // control-file path — a stale /.ecrou-exit must die even when
+        // a run provisions nothing else.
+        provision(&image, &["/etc/marker"], &[]).unwrap();
+        assert!(!stat_exists(&image, "/etc/marker").unwrap());
     }
 
     #[test]
