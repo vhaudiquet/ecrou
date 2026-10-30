@@ -1,27 +1,29 @@
 name: ecrou
 base: core26
-# The version is adopted from the workspace Cargo.toml at pull time —
-# the same value the binary reports with --version. One number, one
-# place to bump.
 adopt-info: ecrou
 title: ecrou
-summary: The strictly confined microVM runtime
+summary: a small microVM runtime based on libkrun
 description: |
   ecrou boots disposable Linux environments as one-shot microVMs on
-  libkrun: it resolves an image reference, boots one VM per command
-  with live stdio, propagates the exit code, and throws the machine
-  away. Persistence crosses an explicit `-v/--volume` share or it does not
-  happen.
+  libkrun: it resolves an image reference, boots the microVM,
+  runs the command, and throws the machine away.
+  Volume sharing `-v` and other features are available.
+
+  ## Install
+
+  ecrou is strictly confined.
+
+      sudo snap install ecrou
 
   ## First run
 
-  Connect the KVM interface (home and network connect on their own):
+  Connect the KVM interface:
 
       sudo snap connect ecrou:kvm
 
-  Then run a command in a microVM:
+  Then run a microVM:
 
-      ecrou run ubuntu -- uname -a
+      ecrou run -it ubuntu
 
   ## Diagnostics
 
@@ -32,8 +34,6 @@ description: |
 
   - image cache: `~/snap/ecrou/common/cache/ecrou`
 
-  The home interface does not cover dotfiles, so the XDG
-  directories are redirected into the snap's common data area.
 license: MIT
 website: https://github.com/vhaudiquet/ecrou
 contact: https://github.com/vhaudiquet/ecrou/issues
