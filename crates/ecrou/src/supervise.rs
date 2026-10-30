@@ -221,27 +221,111 @@ pub(crate) fn wait_machine(
     decode_status(status, exit_file_host)
 }
 
+/// Translate the machine child's raw wait status into the result of a
+/// run. Only the guest init can mint a guest exit code: it reports the
+/// payload's code through the control file and the VMM exits the child
+/// with it. Everything else is ecrou's own machinery talking, and is
+/// an error, never a code — the shell's 128+n convention would
+/// otherwise masquerade a SIGKILLed or OOM-killed VMM as the payload
+/// having died by that signal.
 fn decode_status(status: libc::c_int, exit_file_host: &Path) -> Result<i32> {
     use std::os::unix::process::ExitStatusExt;
-    let code = if let Some(sig) = std::process::ExitStatus::from_raw(status).signal() {
-        128 + sig
-    } else {
-        std::process::ExitStatus::from_raw(status)
-            .code()
-            .unwrap_or(125)
-    };
-    if code == 125 {
-        // Boot failure: the init blob never reported a code. The
-        // control file is the diagnostic when it ran partway.
-        if let Ok(s) = std::fs::read_to_string(exit_file_host) {
-            if let Ok(c) = s.trim().parse::<i32>() {
-                return Ok(c);
-            }
-        }
+    let status = std::process::ExitStatus::from_raw(status);
+    if let Some(sig) = status.signal() {
+        // The init catches the payload's signals and reports them as
+        // codes, so a signal on the machine child means the VMM or the
+        // engine died: the payload never reported.
         return Err(Error::Other(anyhow!(
-            "the machine failed to boot; run with --quiet off and check the \
-             console output above"
+            "the machine process died from signal {sig}; this is an \
+             engine or hypervisor failure, not the payload's exit code"
         )));
     }
-    Ok(code)
+    let code = status.code().unwrap_or(125);
+    match code {
+        // Reserved by the machinery itself: 125 is the child's bail
+        // code (boot failure), 126 is the init refusing to run the
+        // payload (a share that would not mount, a missing workdir). A
+        // payload that genuinely exits either code reported through
+        // the control file first — the file is the arbiter.
+        125 | 126 => {
+            if let Ok(s) = std::fs::read_to_string(exit_file_host) {
+                if let Ok(c) = s.trim().parse::<i32>() {
+                    return Ok(c);
+                }
+            }
+            let cause = if code == 125 {
+                "the machine failed to boot"
+            } else {
+                "the guest init aborted before running the payload: a \
+                 share failed to mount, or the workdir does not exist"
+            };
+            Err(Error::Other(anyhow!(
+                "{cause}; check the console output above"
+            )))
+        }
+        _ => Ok(code),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The raw waitpid status for a child exited with `code`.
+    fn exited(code: i32) -> libc::c_int {
+        code << 8
+    }
+
+    /// The raw waitpid status for a child killed by `sig`.
+    fn signaled(sig: i32) -> libc::c_int {
+        sig
+    }
+
+    #[test]
+    fn a_signaled_machine_is_an_engine_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        for raw in [signaled(libc::SIGSEGV), signaled(libc::SIGKILL), signaled(libc::SIGTERM)] {
+            let err = decode_status(raw, &dir.path().join("absent")).unwrap_err();
+            assert!(
+                err.to_string().contains("engine or hypervisor failure"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_boot_failure_is_an_error_and_a_payload_code_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let exit_file = dir.path().join(".ecrou-exit");
+        // 125 with no report: the child's bail code.
+        let err = decode_status(exited(125), &exit_file).unwrap_err();
+        assert!(err.to_string().contains("failed to boot"), "{err}");
+        // 126 with no report: the init refused (share, workdir).
+        let err = decode_status(exited(126), &exit_file).unwrap_err();
+        assert!(err.to_string().contains("share failed to mount"), "{err}");
+        // A payload that genuinely exited a reserved code reported
+        // through the control file first.
+        std::fs::write(&exit_file, "7").unwrap();
+        assert_eq!(decode_status(exited(125), &exit_file).unwrap(), 7);
+        std::fs::write(&exit_file, "3").unwrap();
+        assert_eq!(decode_status(exited(126), &exit_file).unwrap(), 3);
+    }
+
+    #[test]
+    fn an_ordinary_code_needs_no_control_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            decode_status(exited(42), &dir.path().join("absent")).unwrap(),
+            42
+        );
+        assert_eq!(
+            decode_status(exited(0), &dir.path().join("absent")).unwrap(),
+            0
+        );
+        // A garbage control file does not turn a normal code into an
+        // error either — the code came through the VMM's own exit.
+        let exit_file = dir.path().join(".ecrou-exit");
+        std::fs::write(&exit_file, "not a number").unwrap();
+        assert_eq!(decode_status(exited(42), &exit_file).unwrap(), 42);
+    }
 }
