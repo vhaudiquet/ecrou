@@ -6,71 +6,83 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "ecrou",
     version,
-    about = "One-shot microVM environments on libkrun",
-    after_help = "Examples:\n  ecrou run -it alpine                    a shell in the machine\n  ecrou run ./rootfs.tar.gz -- uname -a   boot a local rootfs archive\n  ecrou run -v $PWD:/workspace ubuntu -- make"
+    about = "Run commands in disposable microVMs on libkrun",
+    after_help = "Examples:\n  ecrou run -it alpine                      a shell in the machine\n  ecrou run ubuntu -- uname -a              one command; its exit code propagates\n  ecrou run -v $PWD:/src ubuntu -- make     share the working tree into the machine\n  ecrou pull alpine                         fetch or refresh the cache entry\n  ecrou probe                               report what a run would find on this host"
 )]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
-    /// Print diagnostic messages
+    /// Print diagnostics, including engine messages
     #[arg(long, global = true)]
     pub verbose: bool,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Run a command in a fresh microVM from an image
+    /// Run a command in a fresh microVM
+    ///
+    /// IMAGE is a distro name (alpine, ubuntu:noble), an OCI image
+    /// reference (ghcr.io/org/image:tag, ubuntu@sha256:...), or a
+    /// local rootfs archive (a path: ./rootfs.tar.gz). The machine
+    /// boots once for the command, streams its stdio, and the run
+    /// exits with the command's exit code; the machine is thrown
+    /// away. Persistence crosses a --volume share or it does not
+    /// happen.
     Run(RunArgs),
-    /// Bake a command into an image's cache entry: the command runs in
-    /// a machine over a freshly prepared rootfs, and the result is
-    /// persisted, so every later boot of the image carries what the
-    /// command installed. Cached entries are reused as-is; --no-cache
-    /// re-downloads and re-provisions.
+    /// Bake a provisioned layer over a base image
+    ///
+    /// Two shapes. --spec FILE describes the layer in checked-in YAML
+    /// (base, packages, run); the layer is keyed by the file's
+    /// content, so the same spec never provisions twice and a changed
+    /// spec never reuses an old layer, and --layer NAME names it for
+    /// `run --layer NAME`. `provision IMAGE -- COMMAND` bakes the
+    /// command into the image's cache entry itself: every later boot
+    /// of that image carries what the command installed.
     Provision {
-        /// Distribution name or OCI image reference; the spec's `base`
-        /// when omitted and the spec carries one
+        /// Base image: distro name or OCI reference; not needed when
+        /// the spec carries a base
         image: Option<String>,
-        /// A provisioning spec file (YAML: base, packages, run) — the
-        /// layer it describes is keyed by the file's content, so the
-        /// same spec never provisions twice and a changed spec never
-        /// reuses an old layer
+        /// Provisioning spec file (YAML: base, packages, run); the
+        /// layer it describes is keyed by the file's content
         #[arg(long)]
         spec: Option<std::path::PathBuf>,
-        /// Name the provisioned layer, so runs can boot it by name
-        /// (`run --layer NAME`) without re-deriving anything
+        /// Name the provisioned layer, so `run --layer NAME` boots it
         #[arg(long)]
         layer: Option<String>,
         /// Ignore the cache: re-download the base and re-provision
         #[arg(long)]
         no_cache: bool,
-        /// The provisioning command. An argument vector after `--` is
-        /// taken literally; a single quoted line runs through the
-        /// image's shell.
+        /// Provisioning command, baked into the image's cache entry
+        /// (use with IMAGE, without --spec)
         #[arg(last = true)]
         command: Vec<String>,
     },
-    /// Fetch or refresh an image's cache entry without booting it:
-    /// re-checks unpinned OCI tags against the registry and floating
-    /// distro aliases against the distro, downloading only when the
-    /// entry is absent or has moved. `run` never contacts the
-    /// registry on a cached image — this is the refresh operation.
+    /// Fetch or refresh an image's cache entry without booting it
+    ///
+    /// Unpinned OCI tags are re-checked against the registry digest
+    /// and floating distro aliases (latest, lts, edge) re-resolved;
+    /// only an absent or moved entry is downloaded. `run` never
+    /// contacts a registry on a cached image: this is the freshness
+    /// operation, docker-pull semantics.
     Pull {
         /// Distribution name or OCI image reference
         image: String,
-        /// Ignore the cache: re-download even when the entry is
-        /// present and current
+        /// Re-download even when the entry is present and current
         #[arg(long)]
         no_cache: bool,
     },
     /// Report what a run would find on this host
+    ///
+    /// KVM working (device, API version, nested-virt state), the
+    /// engine (libkrun.so.1) loadable, and the image cache usable.
+    /// The support tool and the confinement diagnostic.
     Probe,
 }
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
-    /// Distribution name, OCI image reference, or a local rootfs
-    /// archive (a path: ./rootfs.tar.gz, /tmp/rootfs.tar); not needed
-    /// with `--layer`, which boots a provisioned cache entry
+    /// Distro name, OCI image reference, or a local rootfs archive
+    /// path (./rootfs.tar.gz); not needed with --layer
     #[arg(required_unless_present = "layer")]
     pub image: Option<String>,
     /// Keep the machine's stdin open: the host's stdin feeds the
@@ -83,33 +95,35 @@ pub struct RunArgs {
     pub tty: bool,
     /// Command to run in the machine; the image's default shell when
     /// omitted. An argument vector after `--` is taken literally; a
-    /// single quoted line runs through the image's shell.
+    /// single quoted line runs through the image's shell as `sh -c`.
     #[arg(last = true)]
     pub command: Vec<String>,
-    /// Directory to share into the machine as HOST:GUEST[:ro] (repeatable)
+    /// Share a host directory into the machine as HOST:GUEST[:ro]
+    /// (repeatable; the guest path must be absolute)
     #[arg(short = 'v', long = "volume")]
     pub volumes: Vec<String>,
-    /// Guest memory size
+    /// Guest memory size (bytes, or with a K/M/G suffix)
     #[arg(short = 'm', long, default_value = "1G")]
     pub memory: String,
-    /// Guest working directory
+    /// Working directory inside the machine
     #[arg(short = 'w', long, default_value = "/")]
     pub workdir: String,
-    /// Guest environment KEY=VALUE (repeatable)
+    /// Guest environment KEY=VALUE (repeatable; the host environment
+    /// is never inherited)
     #[arg(short = 'e', long = "env")]
     pub env: Vec<String>,
-    /// Suppress console noise
+    /// Silence engine and kernel messages on the console
     #[arg(long)]
     pub quiet: bool,
-    /// Capture the payload's stdout and stderr into files in this
-    /// directory: DIR/stdout and DIR/stderr. Created when missing.
+    /// Capture the payload's stdout and stderr into DIR/stdout and
+    /// DIR/stderr (incompatible with --tty; created when missing)
     #[arg(long)]
     pub capture: Option<std::path::PathBuf>,
-    /// Ignore the cache and download a fresh image
+    /// Ignore the cache: download the image fresh
     #[arg(long)]
     pub no_cache: bool,
-    /// Boot a named provisioned layer (see `provision --layer`)
-    /// instead of resolving an image
+    /// Boot a named provisioned layer (see provision --layer)
+    /// instead of an image
     #[arg(long)]
     pub layer: Option<String>,
 }
