@@ -8,10 +8,28 @@
 
 ### Installation
 
-ecrou is available as a strictly confined snap:
+Linux (strictly confined snap, KVM required):
 ```
 sudo snap install ecrou
 sudo snap connect ecrou:kvm
+```
+
+macOS (Apple Silicon, Homebrew):
+```
+brew tap vhaudiquet/ecrou https://github.com/vhaudiquet/homebrew-ecrou
+brew install ecrou
+```
+
+The macOS build loads libkrun from the
+[`libkrun/homebrew-krun`](https://github.com/libkrun/homebrew-krun) tap
+at runtime and boots through Hypervisor.framework; the formula signs
+the binary with the hypervisor entitlement macOS requires, so the
+install needs no extra steps. Building from source instead:
+
+```
+brew install libkrun/homebrew-krun/libkrun e2fsprogs
+cargo build --release -p ecrou-cli
+codesign --force --sign - --entitlements packaging/macos/ecrou.entitlements   target/release/ecrou
 ```
 
 ### Usage

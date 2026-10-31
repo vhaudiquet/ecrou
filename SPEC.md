@@ -34,9 +34,11 @@ and fails with a remediation message naming the install when it is
 missing; nothing links at build time, and the snap bundles the library
 plus libkrunfw next to itself.
 
-KVM is required; there is no TCG fallback. A machine without working
-KVM is `Error::KvmUnavailable` with the remediation text, and `ecrou
-probe` reports it before any run. The VMM runs inside the machine
+KVM is required on Linux, Hypervisor.framework on macOS; there is no
+TCG fallback. A machine without working KVM is `Error::KvmUnavailable`
+with the remediation text, and `ecrou probe` reports it before any
+run (on macOS the probe goes further: it checks the hypervisor
+entitlement too, see the macOS section). The VMM runs inside the machine
 child, not on the caller's thread (see Cancellation).
 
 libkrun's mapped-volumes entry point is explicitly unsupported on
@@ -281,6 +283,65 @@ stop:
   standing re-measurement of the ln driver's throughput. First data
   point: 24 s end to end, boot and apt included, cache-warm (snap
   0.1.0 engine, October 2026).
+
+## macOS
+
+The same ABI, a different substrate. The engine is dlopen'd from the
+Homebrew kegs (`libkrun` from the `libkrun/homebrew-krun` tap, which
+builds the HVF backend and links Hypervisor.framework); the keg path
+is a search fallback, not a hard-coded prefix, and the run fails with
+a remediation naming the tap when the library is absent. macOS needs
+no snap: no store sandbox, no staged libraries — Homebrew's prefix is
+the distribution channel. There is no riscv64 or amd64 build; libkrun
+supports Hypervisor.framework on arm64 only.
+
+Two macOS facts shape the code:
+
+**Bare-soname dlopens.** The engine loads `libkrunfw.5.dylib` by bare
+soname at `krun_start_enter`, and a libarchive-capable `mke2fs` loads
+`libarchive.13.dylib` the same way. dyld never searches the brew
+prefix, and it reads `DYLD_FALLBACK_LIBRARY_PATH` once, at process
+startup — a setenv afterwards is invisible to it. The CLI therefore
+re-execs itself (exec restarts dyld) when the variable is unset and
+the kegs exist; library consumers must set the variable themselves
+before their process starts. mkfs children are exec'd fresh, so the
+per-spawn env in image.rs works regardless.
+
+**The hypervisor entitlement.** Hypervisor.framework grants VM
+creation only to binaries signed with the
+`com.apple.security.hypervisor` entitlement — current macOS enforces
+this for ad-hoc-signed binaries too, where older releases granted the
+framework implicitly. The denial surfaces as `hv_vm_create` returning
+`HV_DENIED` (0xfae94007), which without a probe showed up only as an
+opaque `krun_start_enter` EINVAL after a full image build. `probe` now
+creates and destroys a real framework VM (dlopen'd, no link-time
+dependency) so the denial is reported with the re-sign remediation
+before any image work. Packaging signs at install (the Homebrew
+formula, the same pattern krunkit's formula carries, and the release
+tarball's codesign step); a `cargo build` developer re-signs after
+each build, per the README snippet.
+
+The ext4 image is built the same way as on Linux, with one fallback:
+when the found `mke2fs` cannot populate from a tarball (Homebrew's
+e2fsprogs bottle builds without libarchive), the image builder
+unpacks the rootfs to a tree and lets mke2fs populate from the
+directory — slower, and run states it in the log. The T6 strace audit
+and the `/dev/kvm` gating stay Linux-only: strace does not exist on
+macOS and the hypervisor gate is the entitlement probe instead. CI
+runs the whole gate plus a real `ecrou run` boot on a `macos-26`
+runner; the release workflow ships a signed darwin-arm64 tarball.
+
+## Homebrew
+
+`packaging/homebrew/Formula/ecrou.rb` installs into a
+`vhaudiquet/homebrew-ecrou` tap. The formula carries the runtime
+dependencies (`libkrun` from the krun tap, `e2fsprogs`, `libarchive`),
+builds from source with cargo, and re-signs the binary with the
+entitlements plist from `packaging/macos/` — brew bottles are
+ad-hoc signed, so the signature is part of the formula's install,
+not of the artifact. The formula is pinned by tag until the first
+release exists, then switches to the release tarball + sha256 the
+release workflow produces.
 
 ## Snap packaging
 
