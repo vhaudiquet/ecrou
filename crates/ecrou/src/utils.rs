@@ -226,35 +226,6 @@ const DYLD_KEGS: &[&str] = &["libkrunfw", "libarchive"];
 #[cfg(not(target_os = "macos"))]
 const DYLD_KEGS: &[&str] = &[];
 
-/// Directories the libarchive dylib can be dlopen'd from, joined for
-/// DYLD_FALLBACK_LIBRARY_PATH. Superseded by dyld_fallback_dirs; kept
-/// only until the image builder stops calling it.
-#[cfg(target_os = "macos")]
-pub fn libarchive_fallback_dirs() -> Option<String> {
-    let mut dirs = Vec::new();
-    for prefix in BREW_PREFIXES {
-        let dir = Path::new(prefix).join("opt/libarchive/lib");
-        if dir.is_dir() {
-            dirs.push(dir.as_os_str().to_os_string());
-        }
-    }
-    if dirs.is_empty() {
-        None
-    } else {
-        Some(
-            std::env::join_paths(dirs)
-                .ok()?
-                .to_string_lossy()
-                .into_owned(),
-        )
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn libarchive_fallback_dirs() -> Option<String> {
-    None
-}
-
 /// Directories the bare-soname dlopens can be satisfied from, joined
 /// for DYLD_FALLBACK_LIBRARY_PATH, or None when none of them exists.
 pub fn dyld_fallback_dirs() -> Option<String> {

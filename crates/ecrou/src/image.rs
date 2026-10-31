@@ -9,6 +9,14 @@
 //! lose them. An unprivileged extract cannot preserve a tar's owners
 //! (chown to an arbitrary uid is root's alone); a tarball to image
 //! pipeline never needs one.
+//!
+//! Tarball populate is a build-time choice in e2fsprogs: compiled in,
+//! it loads libarchive by dlopen at runtime (`libarchive.so.13` on
+//! Linux, `libarchive.13.dylib` on macOS), so presence cannot be
+//! assumed from the binary. A build without it (Homebrew's bottle, for
+//! one) gets the tree-populate fallback: the tarball is unpacked and
+//! mke2fs copies the directory, which loses the tar owners — flagged
+//! through the progress channel, never silently.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,6 +24,16 @@ use std::process::Command;
 use anyhow::{anyhow, Context};
 
 use crate::progress::Progress;
+
+/// Appended to a mkfs failure whose stderr names libarchive: the
+/// tarball populate loads it by dlopen at runtime, and the message
+/// names the platform's way to get the dylib in place.
+#[cfg(target_os = "macos")]
+const LIBARCHIVE_REMEDIATION: &str = "; the populate step loads libarchive \
+by dlopen at runtime, and `brew install libarchive` provides the dylib";
+#[cfg(not(target_os = "macos"))]
+const LIBARCHIVE_REMEDIATION: &str = "; the populate step loads libarchive \
+at runtime (the snap stages libarchive13 next to the binary)";
 
 /// Build the rootfs image at `image` from `tarball`.
 ///
@@ -41,7 +59,7 @@ pub(crate) fn build_rootfs_image(
         }
     }
     let source: &Path = merged.as_deref().unwrap_or(tarball);
-    let result = mkfs_from_tar(source, image);
+    let result = mkfs_from_tar(source, image, progress);
     if let Some(side) = merged {
         // The merged archive has value only until mke2fs consumes it;
         // a failure to clean up must not mask mkfs's own error.
@@ -71,7 +89,7 @@ pub(crate) fn looks_like_ext4(image: &Path) -> bool {
 /// Build the entry image: mke2fs consumes the archive (merged first
 /// when the tarball is an OCI layer bundle) and the result publishes
 /// atomically.
-fn mkfs_from_tar(tarball: &Path, image: &Path) -> anyhow::Result<()> {
+fn mkfs_from_tar(tarball: &Path, image: &Path, progress: &dyn Progress) -> anyhow::Result<()> {
     // The build lands in a sibling file first and renames over the
     // image only on success. mke2fs creates and sizes the file before
     // it populates, so a failed build would otherwise leave a
@@ -79,7 +97,7 @@ fn mkfs_from_tar(tarball: &Path, image: &Path) -> anyhow::Result<()> {
     // than the tarball it came from, and trusted by the freshness
     // check forever after.
     let staging = image.with_extension("part");
-    let built = build_ext4(tarball, &staging);
+    let built = build_ext4(tarball, &staging, progress);
     if built.is_ok() {
         std::fs::rename(&staging, image)
             .with_context(|| format!("publishing {}", image.display()))?;
@@ -89,10 +107,75 @@ fn mkfs_from_tar(tarball: &Path, image: &Path) -> anyhow::Result<()> {
     built
 }
 
+/// Whether the system mke2fs populates straight from a tarball. The
+/// support is compiled in or out (and dlopen'd at runtime when in), so
+/// the only honest probe is the real tool over a minimal archive:
+/// build a four-MiB image from a one-entry tarball once per process
+/// and cache the verdict.
+fn mke2fs_reads_tarballs() -> bool {
+    static VERDICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERDICT.get_or_init(|| {
+        let scratch = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(_) => return false,
+        };
+        let tarball = scratch.path().join("probe.tar");
+        let file = match std::fs::File::create(&tarball) {
+            Ok(file) => file,
+            Err(_) => return false,
+        };
+        let mut builder = tar::Builder::new(file);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_entry_type(tar::EntryType::Regular);
+        if builder
+            .append_data(&mut header, "probe", std::io::empty())
+            .is_err()
+        {
+            return false;
+        }
+        let image = scratch.path().join("probe.ext4");
+        if std::fs::File::create(&image)
+            .and_then(|f| f.set_len(4 * 1024 * 1024))
+            .is_err()
+        {
+            return false;
+        }
+        match mkfs_tool() {
+            Some(mut cmd) => cmd
+                .args(["-q", "-F", "-N", "16", "-d"])
+                .arg(&tarball)
+                .arg(&image)
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false),
+            None => false,
+        }
+    })
+}
+
+/// The mke2fs command, resolved through the tool lookup and, on macOS,
+/// pointed at the directories a dlopen'd libarchive can live in.
+fn mkfs_tool() -> Option<std::process::Command> {
+    let mut cmd = Command::new(crate::utils::find_tool("mkfs.ext4")?);
+    // The child execs fresh, so it reads the variable at startup even
+    // when the parent process itself never had it.
+    if let Some(dirs) = crate::utils::dyld_fallback_dirs() {
+        cmd.env("DYLD_FALLBACK_LIBRARY_PATH", dirs);
+    }
+    Some(cmd)
+}
+
+/// The debugfs command, resolved through the tool lookup.
+fn debugfs_tool() -> Option<Command> {
+    crate::utils::find_tool("debugfs").map(Command::new)
+}
+
 /// Create `image`, size it from a scan of the archive, and run mke2fs
 /// over it. The filesystem size and inode count come from the scan:
 /// mke2fs derives neither from a tar.
-fn build_ext4(tarball: &Path, image: &Path) -> anyhow::Result<()> {
+fn build_ext4(tarball: &Path, image: &Path, progress: &dyn Progress) -> anyhow::Result<()> {
     let (bytes, entries) = tar_scan(tarball)?;
     // Headroom for the journal, the inode tables and block rounding.
     // The file is created sparse, so generous headroom costs nothing
@@ -115,16 +198,44 @@ fn build_ext4(tarball: &Path, image: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("sizing {}", image.display()))?;
     drop(file);
 
-    let out = Command::new("mkfs.ext4")
+    // Tarball populate when the tool can, tree populate when it
+    // cannot: the fallback loses the tar's owners (every entry takes
+    // the invoking user's), which is said out loud, not swallowed.
+    let extracted: Option<PathBuf> = if mke2fs_reads_tarballs() {
+        None
+    } else {
+        let dir = image.with_extension("populate");
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        crate::extract::tar_decoder(tarball)?
+            .unpack(&dir)
+            .with_context(|| format!("unpacking {} into {}", tarball.display(), dir.display()))?;
+        progress.message(
+            "this mke2fs cannot read tarballs (no libarchive); populating \
+             from the extracted tree, so tar owners are lost",
+        );
+        Some(dir)
+    };
+    let populate: &Path = extracted.as_deref().unwrap_or(tarball);
+    let out = mkfs_tool()
+        .ok_or_else(|| anyhow!("mkfs.ext4 not found: install e2fsprogs"))?
         .args(["-q", "-F", "-N", &inodes.to_string(), "-d"])
-        .arg(tarball)
+        .arg(populate)
         .arg(image)
         .output()
-        .map_err(|e| anyhow!("mkfs.ext4 not found ({e}): install e2fsprogs; the snap stages it"))?;
+        .map_err(|e| anyhow!("mkfs.ext4 not runnable ({e}): install e2fsprogs"))?;
+    if let Some(dir) = extracted {
+        // A failure to clean the tree must not mask mkfs's own verdict.
+        let _ = std::fs::remove_dir_all(dir);
+    }
     if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let note = if stderr.contains("libarchive") {
+            LIBARCHIVE_REMEDIATION
+        } else {
+            ""
+        };
         return Err(anyhow!(
-            "mkfs.ext4 failed building the rootfs image: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            "mkfs.ext4 failed building the rootfs image: {stderr}{note}"
         ));
     }
     Ok(())
@@ -143,21 +254,32 @@ fn tar_scan(tarball: &Path) -> anyhow::Result<(u64, u64)> {
     Ok((bytes, entries))
 }
 
-/// Copy the cache entry image into the scratch directory. cp reflinks
-/// where the filesystem has them and keeps the copy sparse either way:
-/// an image occupying 400 MiB must not materialize a GiB of holes.
+/// Copy the cache entry image into the scratch directory. On Linux cp
+/// reflinks where the filesystem has them and keeps the copy sparse;
+/// an image occupying 400 MiB must not materialize a GiB of holes. On
+/// macOS APFS clones the file at the block level through fclonefileat,
+/// which std::fs::copy drives (and a cross-volume copy falls back to a
+/// plain read/write).
 pub(crate) fn copy_image(src: &Path, dst: &Path) -> anyhow::Result<()> {
-    let out = Command::new("cp")
-        .args(["--reflink=auto", "--sparse=auto"])
-        .arg(src)
-        .arg(dst)
-        .output()
-        .map_err(|e| anyhow!("cp not found ({e}): coreutils is required"))?;
-    if !out.status.success() {
-        return Err(anyhow!(
-            "copying the rootfs image failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+    #[cfg(target_os = "macos")]
+    {
+        std::fs::copy(src, dst)
+            .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let out = Command::new("cp")
+            .args(["--reflink=auto", "--sparse=auto"])
+            .arg(src)
+            .arg(dst)
+            .output()
+            .map_err(|e| anyhow!("cp not found ({e}): coreutils is required"))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "copying the rootfs image failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
     }
     Ok(())
 }
@@ -190,12 +312,13 @@ pub(crate) fn provision(
         script.push_str(&format!("sif {guest} mode 0{:o}\n", 0o100000 | mode));
     }
     std::fs::write(&cmds, script).with_context(|| format!("writing {}", cmds.display()))?;
-    let out = Command::new("debugfs")
+    let out = debugfs_tool()
+        .ok_or_else(|| anyhow!("debugfs not found: install e2fsprogs"))?
         .args(["-w", "-f"])
         .arg(&cmds)
         .arg(image)
         .output()
-        .map_err(|e| anyhow!("debugfs not found ({e}): install e2fsprogs; the snap stages it"))?;
+        .map_err(|e| anyhow!("debugfs not runnable ({e})"))?;
     let _ = std::fs::remove_file(&cmds);
     if !out.status.success() {
         return Err(anyhow!(
@@ -212,12 +335,13 @@ pub(crate) fn provision(
 /// reader (the exit-code control file) holds an integer, so those
 /// lines are dropped. An absent file reads back empty.
 pub(crate) fn read_file(image: &Path, guest: &str) -> anyhow::Result<String> {
-    let out = Command::new("debugfs")
+    let out = debugfs_tool()
+        .ok_or_else(|| anyhow!("debugfs not found: install e2fsprogs"))?
         .arg("-R")
         .arg(format!("cat {guest}"))
         .arg(image)
         .output()
-        .map_err(|e| anyhow!("debugfs not found ({e}): install e2fsprogs"))?;
+        .map_err(|e| anyhow!("debugfs not runnable ({e})"))?;
     let text = String::from_utf8_lossy(&out.stdout);
     Ok(text
         .lines()
@@ -229,12 +353,13 @@ pub(crate) fn read_file(image: &Path, guest: &str) -> anyhow::Result<String> {
 /// Whether a guest path exists in the image: a debugfs stat that finds
 /// an inode. Symlinks resolve; stat follows them like the guest will.
 pub(crate) fn stat_exists(image: &Path, guest: &str) -> anyhow::Result<bool> {
-    let out = Command::new("debugfs")
+    let out = debugfs_tool()
+        .ok_or_else(|| anyhow!("debugfs not found: install e2fsprogs"))?
         .arg("-R")
         .arg(format!("stat {guest}"))
         .arg(image)
         .output()
-        .map_err(|e| anyhow!("debugfs not found ({e}): install e2fsprogs"))?;
+        .map_err(|e| anyhow!("debugfs not runnable ({e})"))?;
     Ok(String::from_utf8_lossy(&out.stdout).contains("Inode:"))
 }
 
@@ -256,8 +381,8 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
 
     fn have_e2fsprogs() -> bool {
-        Command::new("mkfs.ext4").arg("-V").output().is_ok()
-            && Command::new("debugfs").arg("-V").output().is_ok()
+        crate::utils::find_tool("mkfs.ext4").is_some()
+            && crate::utils::find_tool("debugfs").is_some()
     }
 
     /// A tarball with one root-owned directory and a file owned by uid
@@ -343,23 +468,37 @@ mod tests {
         assert!(looks_like_ext4(&image), "the built image lacks the magic");
         assert!(!work.path().join("rootfs.part").exists());
 
-        let out = Command::new("debugfs")
+        let out = debugfs_tool()
+            .unwrap()
             .arg("-R")
             .arg("stat /etc/marker")
             .arg(&image)
             .output()
             .unwrap();
         let stat = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            stat.lines()
-                .any(|l| l.contains("User:") && l.contains("104")),
-            "{stat}"
-        );
-        assert!(
-            stat.lines()
-                .any(|l| l.contains("Group:") && l.contains("104")),
-            "{stat}"
-        );
+        if mke2fs_reads_tarballs() {
+            // Tarball populate bakes the archive's owners in.
+            assert!(
+                stat.lines()
+                    .any(|l| l.contains("User:") && l.contains("104")),
+                "{stat}"
+            );
+            assert!(
+                stat.lines()
+                    .any(|l| l.contains("Group:") && l.contains("104")),
+                "{stat}"
+            );
+        } else {
+            // The tree fallback cannot: every entry carries the
+            // invoking user's ids, which is the documented loss.
+            use std::os::unix::fs::MetadataExt;
+            let uid = std::fs::metadata(&image).unwrap().uid();
+            assert!(
+                stat.lines()
+                    .any(|l| l.contains("User:") && l.contains(&uid.to_string())),
+                "{stat}"
+            );
+        }
     }
 
     #[test]
@@ -393,7 +532,8 @@ mod tests {
         assert!(stat_exists(&image, "/ecrou-init").unwrap());
         assert!(!stat_exists(&image, "/etc/marker-does-not-exist").unwrap());
 
-        let out = Command::new("debugfs")
+        let out = debugfs_tool()
+            .unwrap()
             .arg("-R")
             .arg("stat /ecrou-init")
             .arg(&image)
