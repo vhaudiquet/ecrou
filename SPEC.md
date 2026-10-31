@@ -344,9 +344,13 @@ dependencies (`libkrun` from the krun tap, `e2fsprogs`, `libarchive`),
 builds from source with cargo, and re-signs the binary with the
 entitlements plist from `packaging/homebrew/` — brew bottles are
 ad-hoc signed, so the signature is part of the formula's install,
-not of the artifact. The formula is pinned by tag until the first
-release exists, then switches to the release tarball + sha256 the
-release workflow produces.
+not of the artifact. The in-repo formula's tag pin is a placeholder:
+the release workflow rewrites url and sha256 when it pushes the
+formula to the tap. Homebrew's tap-trust gate refuses dependencies
+from third-party taps until their tap is trusted, so the README
+leads with `brew trust --tap libkrun/krun` and CI trusts the tap
+before its install; removing that tax is another argument for
+libkrun landing in homebrew-core.
 
 ## Snap packaging
 
