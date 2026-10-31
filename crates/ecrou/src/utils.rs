@@ -160,6 +160,125 @@ pub fn map_oci_arch(arch: &str) -> String {
     Arch::from_str(arch).oci_name().to_string()
 }
 
+// ============================================================================
+// External tool lookup
+// ============================================================================
+
+/// The Homebrew prefixes the lookup falls back to. Empty off macOS:
+/// Homebrew does not exist there and PATH is the whole story.
+#[cfg(target_os = "macos")]
+pub const BREW_PREFIXES: &[&str] = &["/opt/homebrew", "/usr/local"];
+#[cfg(not(target_os = "macos"))]
+pub const BREW_PREFIXES: &[&str] = &[];
+
+/// The keg-only formulae the run's external tools come from, in the
+/// order they should be preferred. e2fsprogs is keg-only in Homebrew
+/// (its sbin never reaches PATH), and the tap ships its own variant
+/// built with libarchive, which outranks the core bottle.
+#[cfg(target_os = "macos")]
+const BREW_TOOL_FORMULAE: &[&str] = &["e2fsprogs-libarchive", "e2fsprogs"];
+#[cfg(not(target_os = "macos"))]
+const BREW_TOOL_FORMULAE: &[&str] = &[];
+
+/// Locate an external tool the run shells out to: PATH first, then
+/// the Homebrew keg directories. Returns the path, so callers spawn a
+/// deterministic binary instead of a whatever-came-first `Command`.
+pub fn find_tool(name: &str) -> Option<PathBuf> {
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join(name);
+            if is_executable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    for prefix in BREW_PREFIXES {
+        for formula in BREW_TOOL_FORMULAE {
+            for sub in ["sbin", "bin"] {
+                let candidate = Path::new(prefix)
+                    .join("opt")
+                    .join(formula)
+                    .join(sub)
+                    .join(name);
+                if is_executable(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// The brew kegs whose dylibs are loaded by bare soname at runtime:
+/// libkrunfw (loaded by libkrun) and libarchive (loaded by a
+/// libarchive-capable mke2fs). dyld's fallback search never reaches
+/// the brew prefix, so these directories have to land in
+/// DYLD_FALLBACK_LIBRARY_PATH before any of those loads happen.
+#[cfg(target_os = "macos")]
+const DYLD_KEGS: &[&str] = &["libkrunfw", "libarchive"];
+#[cfg(not(target_os = "macos"))]
+const DYLD_KEGS: &[&str] = &[];
+
+/// Directories the libarchive dylib can be dlopen'd from, joined for
+/// DYLD_FALLBACK_LIBRARY_PATH. Superseded by dyld_fallback_dirs; kept
+/// only until the image builder stops calling it.
+#[cfg(target_os = "macos")]
+pub fn libarchive_fallback_dirs() -> Option<String> {
+    let mut dirs = Vec::new();
+    for prefix in BREW_PREFIXES {
+        let dir = Path::new(prefix).join("opt/libarchive/lib");
+        if dir.is_dir() {
+            dirs.push(dir.as_os_str().to_os_string());
+        }
+    }
+    if dirs.is_empty() {
+        None
+    } else {
+        Some(
+            std::env::join_paths(dirs)
+                .ok()?
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn libarchive_fallback_dirs() -> Option<String> {
+    None
+}
+
+/// Directories the bare-soname dlopens can be satisfied from, joined
+/// for DYLD_FALLBACK_LIBRARY_PATH, or None when none of them exists.
+pub fn dyld_fallback_dirs() -> Option<String> {
+    let mut dirs = Vec::new();
+    for prefix in BREW_PREFIXES {
+        for keg in DYLD_KEGS {
+            let dir = Path::new(prefix).join("opt").join(keg).join("lib");
+            if dir.is_dir() {
+                dirs.push(dir.into_os_string());
+            }
+        }
+    }
+    if dirs.is_empty() {
+        None
+    } else {
+        Some(
+            std::env::join_paths(dirs)
+                .ok()?
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

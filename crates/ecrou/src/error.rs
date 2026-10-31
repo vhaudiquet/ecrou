@@ -34,6 +34,7 @@ const KVM_NESTED_HINT: &str = "only actionable on x86_64 hosts";
 
 /// Errors returned by the ecrou library API.
 #[derive(Debug, thiserror::Error)]
+#[allow(clippy::enum_variant_names)] // KvmUnavailable is the platform's word; HvUnavailable is macOS's
 pub enum Error {
     /// No working KVM on this host, and ecrou has no software-emulation
     /// fallback. The remediation names the usual causes in order; the
@@ -48,6 +49,18 @@ pub enum Error {
          \x20 access:             sudo usermod -aG kvm $USER  (re-login)"
     )]
     KvmUnavailable(#[source] std::io::Error),
+
+    /// No hardware virtualization on this Mac, and ecrou has no
+    /// software-emulation fallback: libkrun's macOS backend runs on
+    /// the Hypervisor.framework, which means Apple Silicon and
+    /// macOS 14 or newer.
+    #[error(
+        "Hypervisor.framework is not available\n\n\
+         ecrou boots microVMs and needs hardware virtualization:\n\
+         \x20 host:  an Apple Silicon Mac (M1 or later)\n\
+         \x20 os:    macOS 14 or newer"
+    )]
+    HvUnavailable(#[source] std::io::Error),
 
     /// The registry publishes no linux manifest for the requested
     /// architecture; `available` lists the architectures it does serve.
@@ -90,6 +103,19 @@ mod tests {
         let err = Error::KvmUnavailable(std::io::Error::from_raw_os_error(libc::EACCES));
         let printed = format!("{:#}", anyhow::Error::new(err));
         assert!(printed.contains("Permission denied"), "{printed}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hv_unavailable_renders_remediation() {
+        let msg = Error::HvUnavailable(std::io::Error::other("no hvf")).to_string();
+        assert!(msg.contains("Hypervisor.framework is not available"));
+        assert!(msg.contains("Apple Silicon"));
+        let printed = format!(
+            "{:#}",
+            anyhow::Error::new(Error::HvUnavailable(std::io::Error::other("no hvf")))
+        );
+        assert!(printed.contains("no hvf"), "{printed}");
     }
 
     #[test]

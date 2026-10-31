@@ -116,8 +116,15 @@ fn cmd_probe() -> std::process::ExitCode {
 
     let mut ok = true;
 
-    print!("kvm:          ");
-    match krun::kvm_probe() {
+    print!(
+        "{}:      ",
+        if cfg!(target_os = "macos") {
+            "hypervisor"
+        } else {
+            "kvm"
+        }
+    );
+    match krun::hypervisor_probe() {
         Ok(()) => println!("ok"),
         Err(err) => {
             ok = false;
@@ -145,12 +152,20 @@ fn cmd_probe() -> std::process::ExitCode {
     print!("e2fsprogs:    ");
     let mut tools_ok = true;
     for tool in ["mkfs.ext4", "debugfs"] {
-        match std::process::Command::new(tool).arg("-V").output() {
-            Ok(_) => {}
-            Err(err) => {
+        match ecrou::utils::find_tool(tool) {
+            Some(path) => match std::process::Command::new(path).arg("-V").output() {
+                Ok(_) => {}
+                Err(err) => {
+                    ok = false;
+                    tools_ok = false;
+                    println!("{tool} not runnable ({err}); the rootfs image cannot be built");
+                    break;
+                }
+            },
+            None => {
                 ok = false;
                 tools_ok = false;
-                println!("missing {tool} ({err}); the rootfs image cannot be built");
+                println!("missing {tool}; install e2fsprogs, the rootfs image cannot be built");
                 break;
             }
         }

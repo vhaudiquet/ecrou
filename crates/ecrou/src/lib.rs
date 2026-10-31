@@ -17,9 +17,9 @@
 //! preparation) and [`vm`] (running a command inside a prepared
 //! rootfs). Public functions return [`Result`] carrying the [`Error`]
 //! enum, so consumers can match on host-readiness failures
-//! ([`Error::KvmUnavailable`], [`Error::ArchNotAvailable`]) versus
-//! ordinary failures ([`Error::Other`], which preserves the full context
-//! chain).
+//! ([`Error::KvmUnavailable`], [`Error::HvUnavailable`],
+//! [`Error::ArchNotAvailable`]) versus ordinary failures
+//! ([`Error::Other`], which preserves the full context chain).
 //!
 //! ## Crate split
 //!

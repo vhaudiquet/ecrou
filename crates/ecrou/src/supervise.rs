@@ -10,6 +10,54 @@ use anyhow::{anyhow, Context};
 use crate::krun::Krun;
 use crate::{Error, Result};
 
+/// The macOS stand-in for `prctl(PR_SET_PDEATHSIG)`: a thread in the
+/// child registers a kqueue filter on the parent pid (EVFILT_PROC,
+/// NOTE_EXIT) and kills this process with SIGKILL when the parent
+/// exits. The kernel fires the filter for an already-dead pid's
+/// registration too, and the getppid check catches the window where
+/// the parent died before registration; SIGKILL itself cannot be
+/// caught, which keeps the child's fate identical to Linux's.
+#[cfg(target_os = "macos")]
+fn watch_parent_or_die() {
+    std::thread::spawn(|| {
+        // Safety: kqueue/kevent on self-owned descriptors; the kevent
+        // structs are plain value types the kernel fills in.
+        unsafe {
+            let kq = libc::kqueue();
+            if kq < 0 {
+                return;
+            }
+            let change = libc::kevent {
+                ident: libc::getppid() as usize,
+                filter: libc::EVFILT_PROC,
+                flags: libc::EV_ADD,
+                fflags: libc::NOTE_EXIT,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            let n = libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null());
+            // A failed registration or an orphaned ppid means the
+            // parent is already gone.
+            if n != 0 || libc::getppid() == 1 {
+                libc::kill(libc::getpid(), libc::SIGKILL);
+            }
+            let mut event: libc::kevent = std::mem::zeroed();
+            loop {
+                let n = libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, std::ptr::null());
+                if n > 0 {
+                    break;
+                }
+                if n < 0
+                    && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                {
+                    break;
+                }
+            }
+            libc::kill(libc::getpid(), libc::SIGKILL);
+        }
+    });
+}
+
 /// Fork the machine process and enter the VM loop inside it. The
 /// child only touches libkrun configuration before entering the VM
 /// loop, which never returns: a normal payload exit ends the child
@@ -23,7 +71,7 @@ pub(crate) fn spawn_machine(
     let child = unsafe { libc::fork() };
     if child == 0 {
         // Safety: after fork the child runs no threads of its own; the
-        // prctl/exit pair has no unwinding preconditions.
+        // kill/exit pair has no unwinding preconditions.
         let bail = |msg: String, code: i32| -> ! {
             // The console file is the channel the parent streams: a
             // boot failure belongs in it, next to whatever the guest
@@ -37,15 +85,24 @@ pub(crate) fn spawn_machine(
             eprintln!("Error: {msg}");
             unsafe { libc::_exit(code) }
         };
+        // The parent-death contract, per platform: Linux delivers
+        // SIGKILL through PR_SET_PDEATHSIG; macOS has no prctl, so
+        // a watcher thread follows the parent through a kqueue and
+        // kills this process when the parent goes away.
+        #[cfg(target_os = "linux")]
         unsafe {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-            // Headless only: unwire the console input (with a tty on
-            // fd 0 libkrun puts that terminal into raw mode, which
-            // fights whoever owns it, and stops a background caller
-            // with SIGTTOU). /dev/null keeps the console on its plain
-            // path and still forwards a Ctrl-C sent to the process
-            // group into the guest. An interactive machine wants the
-            // opposite: fd 0 is its console input by design.
+        }
+        #[cfg(target_os = "macos")]
+        watch_parent_or_die();
+        // Headless only: unwire the console input (with a tty on
+        // fd 0 libkrun puts that terminal into raw mode, which
+        // fights whoever owns it, and stops a background caller
+        // with SIGTTOU). /dev/null keeps the console on its plain
+        // path and still forwards a Ctrl-C sent to the process
+        // group into the guest. An interactive machine wants the
+        // opposite: fd 0 is its console input by design.
+        unsafe {
             if !interactive {
                 let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
                 if null >= 0 {

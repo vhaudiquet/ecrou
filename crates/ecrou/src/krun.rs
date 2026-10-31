@@ -1,13 +1,14 @@
 //! Runtime bindings to libkrun's stable C ABI.
 //!
-//! The library (`libkrun.so.1`) loads through dlopen so a missing
-//! install is a remediation message rather than a link error. The
+//! The library (`libkrun.so.1` on Linux, `libkrun.1.dylib` on macOS)
+//! loads through dlopen so a missing install is a remediation message
+//! rather than a link error. The
 //! symbol signatures mirror the `stable-1.19.x` headers; the main
 //! branch is mid-rewrite to a vtable API and is not the target.
 //!
 //! The founding rule holds for this module too: libkrun's VMM runs in
-//! our process and touches only files, sockets, and `/dev/kvm`, all
-//! inside the confinement budget (SPEC.md).
+//! our process and touches only files and sockets (plus `/dev/kvm` on
+//! Linux), all inside the confinement budget (SPEC.md).
 
 use std::ffi::{c_char, CString};
 use std::os::unix::ffi::OsStrExt;
@@ -19,15 +20,40 @@ use crate::Error;
 
 /// The ABI version libkrun reports for a working `/dev/kvm`
 /// (`KVM_GET_API_VERSION`, the first request of the KVMIO range).
+#[cfg(target_os = "linux")]
 const KVM_GET_API_VERSION: libc::c_ulong = 0xAE00;
+#[cfg(target_os = "linux")]
 const KVM_API_VERSION_EXPECTED: libc::c_int = 12;
 
+#[cfg(target_os = "macos")]
+pub const SONAME: &str = "libkrun.1.dylib";
+#[cfg(not(target_os = "macos"))]
 pub const SONAME: &str = "libkrun.so.1";
 
-/// Remediation shown when libkrun cannot be loaded: distro packaging is
-/// still sparse (Fedora carries it; Debian and Ubuntu do not yet).
+/// Remediation shown when libkrun cannot be loaded: on macOS the
+/// official Homebrew tap bottles the library; Linux distro packaging
+/// is still sparse (Fedora carries it; Debian and Ubuntu do not yet).
+#[cfg(target_os = "macos")]
+const LOAD_REMEDIATION: &str = "install it with `brew install libkrun/krun/libkrun`, \
+or point DYLD_LIBRARY_PATH at the directory holding it";
+#[cfg(not(target_os = "macos"))]
 const LOAD_REMEDIATION: &str = "install libkrun, or point LD_LIBRARY_PATH \
 at the directory holding it (a snap stages it next to the binary)";
+
+/// The paths dlopen is tried against, in order. A bare soname relies
+/// on the loader's own search (LD_LIBRARY_PATH on Linux; on macOS it
+/// never reaches the Homebrew prefix, so the keg paths are named).
+fn load_candidates() -> Vec<std::path::PathBuf> {
+    let mut candidates = vec![std::path::PathBuf::from(SONAME)];
+    for prefix in crate::utils::BREW_PREFIXES {
+        candidates.push(
+            std::path::Path::new(prefix)
+                .join("opt/libkrun/lib")
+                .join(SONAME),
+        );
+    }
+    candidates
+}
 
 macro_rules! symbol {
     ($lib:expr, $name:expr, $ty:ty) => {
@@ -65,11 +91,24 @@ pub struct Krun {
 impl Krun {
     /// dlopen libkrun, failing with the install remediation.
     pub fn load() -> Result<Self> {
-        // Safety: dlopen of a fixed SONAME; the handle lives in `self`
-        // and every symbol below is used through it.
-        let lib = unsafe { libloading::Library::new(SONAME) }
-            .with_context(|| format!("cannot load {SONAME}: {LOAD_REMEDIATION}"))?;
-        Ok(Krun { lib })
+        let candidates = load_candidates();
+        let mut last: Option<anyhow::Error> = None;
+        for candidate in &candidates {
+            // Safety: dlopen of a fixed name; the handle lives in
+            // `self` and every symbol below is used through it.
+            let lib = unsafe { libloading::Library::new(candidate) };
+            match lib {
+                Ok(lib) => return Ok(Krun { lib }),
+                Err(err) => last = Some(anyhow::Error::new(err)),
+            }
+        }
+        let tried = candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("no library name to try")))
+            .with_context(|| format!("cannot load {SONAME} (tried {tried}): {LOAD_REMEDIATION}"))
     }
 
     /// `krun_set_log_level`
@@ -327,9 +366,12 @@ fn path_cstring(path: &Path) -> Result<CString> {
         .with_context(|| format!("path contains a NUL: {}", path.display()))
 }
 
-/// Probe KVM the crun way: open `/dev/kvm` read-write, then check
-/// `KVM_GET_API_VERSION` returns 12.
-pub fn kvm_probe() -> Result<()> {
+/// Probe the host hypervisor. On Linux that is KVM: open `/dev/kvm`
+/// read-write, then check `KVM_GET_API_VERSION` returns 12. On macOS
+/// libkrun runs on the Hypervisor.framework, which exists on Apple
+/// Silicon Macs and nothing else.
+#[cfg(target_os = "linux")]
+pub fn hypervisor_probe() -> Result<()> {
     use std::os::unix::io::AsRawFd;
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -355,10 +397,102 @@ pub fn kvm_probe() -> Result<()> {
     Ok(())
 }
 
+/// The Hypervisor.framework check, in two steps. `sysctl
+/// kern.hv_support` says the machine has the framework; a real
+/// `hv_vm_create` says this process may use it — on current macOS the
+/// entitlement check inside the framework is what kills most
+/// processes, and the denial used to surface only as an opaque
+/// `krun_start_enter` EINVAL after a full image build.
+#[cfg(target_os = "macos")]
+pub fn hypervisor_probe() -> Result<()> {
+    // libkrun's macOS backend is HVF and arm64-only; there is no
+    // build for Intel Macs to probe for.
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        return Err(anyhow::Error::new(Error::HvUnavailable(
+            std::io::Error::other(
+                "libkrun ships no macOS backend for Intel Macs; an Apple Silicon host is required",
+            ),
+        )));
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut supported: libc::c_int = 0;
+        let mut len = std::mem::size_of_val(&supported);
+        // Safety: sysctlbyname with a fixed name and an int-sized
+        // output buffer; the kernel writes only into `supported`.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"kern.hv_support".as_ptr(),
+                (&mut supported as *mut libc::c_int).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(anyhow::Error::new(Error::HvUnavailable(err))
+                .context("reading sysctl kern.hv_support"));
+        }
+        if supported != 1 {
+            return Err(anyhow::Error::new(Error::HvUnavailable(
+                std::io::Error::other("this Mac reports no Hypervisor.framework support"),
+            )));
+        }
+        hypervisor_entitlement_probe()
+    }
+}
+
+/// Create and destroy a real framework VM. `HV_DENIED` is the denial
+/// every macOS packaging step has to design around: the framework
+/// grants VM creation only to binaries signed with the
+/// `com.apple.security.hypervisor` entitlement, so the fix is a
+/// re-sign, not a system change. The framework is dlopen'd by
+/// absolute path — ecrou links nothing, and the path is stable across
+/// releases; if it cannot be opened at all, the probe defers to the
+/// engine instead of inventing a verdict.
+#[cfg(target_os = "macos")]
+fn hypervisor_entitlement_probe() -> Result<()> {
+    const HV_DENIED: u32 = 0xfae94007;
+    let framework =
+        std::path::Path::new("/System/Library/Frameworks/Hypervisor.framework/Hypervisor");
+    // Safety: dlopen of a fixed absolute framework path; symbols are
+    // resolved immediately and the handle lives for this function.
+    let lib = match unsafe { libloading::Library::new(framework) } {
+        Ok(lib) => lib,
+        Err(_) => return Ok(()),
+    };
+    let create = symbol!(
+        &lib,
+        b"hv_vm_create\0",
+        unsafe extern "C" fn(*const std::ffi::c_void) -> u32
+    );
+    let destroy = symbol!(&lib, b"hv_vm_destroy\0", unsafe extern "C" fn() -> u32);
+    // Safety: plain calls into the framework; the VM is destroyed
+    // right away, or never created.
+    let ret = unsafe { create(std::ptr::null()) };
+    if ret == 0 {
+        unsafe { destroy() };
+        return Ok(());
+    }
+    let reason = if ret == HV_DENIED {
+        "the framework denied the process (HV_DENIED): sign the binary with the \
+         com.apple.security.hypervisor entitlement, the way packaging does — \
+         `codesign --force --sign - --entitlements <plist> <binary>`"
+    } else {
+        "the framework refused VM creation"
+    };
+    Err(anyhow::Error::new(Error::HvUnavailable(
+        std::io::Error::other(format!("{reason} (hv error 0x{ret:x})")),
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn kvm_probe_constant_matches_kvm_abi() {
         // KVMIO base 0xAE; KVM_GET_API_VERSION is the first request.
@@ -366,14 +500,30 @@ mod tests {
         assert_eq!(KVM_API_VERSION_EXPECTED, 12);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn kvm_probe_reports_unavailability_or_works() {
-        match kvm_probe() {
+        match hypervisor_probe() {
             Ok(()) => {}
             Err(err) => {
                 let msg = format!("{err:#}");
                 assert!(msg.contains("/dev/kvm"), "unhelpful probe error: {msg}");
                 assert!(msg.contains("usermod"), "remediation missing: {msg}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hypervisor_probe_reports_unavailability_or_works() {
+        match hypervisor_probe() {
+            Ok(()) => {}
+            Err(err) => {
+                let msg = format!("{err:#}");
+                assert!(
+                    msg.contains("Hypervisor.framework"),
+                    "unhelpful probe error: {msg}"
+                );
             }
         }
     }
@@ -389,11 +539,25 @@ mod tests {
             Err(err) => {
                 let msg = format!("{err:#}");
                 assert!(msg.contains(SONAME), "bad load error: {msg}");
-                assert!(
-                    msg.contains("LD_LIBRARY_PATH"),
-                    "remediation missing: {msg}"
-                );
+                // The remediation names the platform's install path:
+                // the loader variable on Linux, the brew tap on macOS.
+                let hint = if cfg!(target_os = "macos") {
+                    "brew install"
+                } else {
+                    "LD_LIBRARY_PATH"
+                };
+                assert!(msg.contains(hint), "remediation missing: {msg}");
             }
+        }
+    }
+
+    #[test]
+    fn load_candidates_start_with_the_bare_soname() {
+        assert_eq!(load_candidates()[0], std::path::PathBuf::from(SONAME));
+        // The brew keg paths exist only as candidates: dlopen tries
+        // them in order and they are listed even when absent.
+        if cfg!(target_os = "macos") {
+            assert!(load_candidates().len() > 1);
         }
     }
 

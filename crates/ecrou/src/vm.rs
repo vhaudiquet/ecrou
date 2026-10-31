@@ -2,7 +2,7 @@
 //! payload with live stdio, propagate its exit code, throw the machine
 //! away.
 //!
-//! The flow is: KVM probe, rootfs prepare (cache-aware download and
+//! The flow is: hypervisor probe, rootfs prepare (cache-aware download and
 //! extraction), guest init written into the scratch rootfs, libkrun
 //! context wired to it, `krun_start_enter` blocking on this thread, then
 //! the control file read back for the exit code. The VMM runs inside
@@ -142,7 +142,7 @@ pub fn run_prepared(rootfs: &PreparedRootfs, options: &RunOptions) -> Result<i32
         }
     }
 
-    krun::kvm_probe()?;
+    krun::hypervisor_probe()?;
     let krun = Krun::load()?;
 
     let ram_mib = parse_memory_mib(&options.memory).map_err(Error::Other)?;
