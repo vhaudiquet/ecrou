@@ -3,7 +3,7 @@
 # krunkit comes from, because the engine is dlopen'd from those kegs
 # at runtime.
 class Ecrou < Formula
-  desc "One-shot microVM environments"
+  desc "a small microVM runtime based on libkrun"
   homepage "https://github.com/vhaudiquet/ecrou"
   # Pinned by tag until the first release exists; switch to the
   # release tarball + sha256 then.
@@ -26,14 +26,14 @@ class Ecrou < Formula
     # with the hypervisor entitlement; on current macOS the signature
     # is a hard requirement, the same one krunkit's formula carries.
     system "codesign", "--force", "--sign", "-",
-      "--entitlements", "packaging/macos/ecrou.entitlements", bin/"ecrou"
+      "--entitlements", "packaging/homebrew/ecrou.entitlements", bin/"ecrou"
   end
 
   def caveats
     <<~EOS
       The binary is ad-hoc signed with the com.apple.security.hypervisor
       entitlement. Rebuilding from source (cargo) requires re-signing:
-        codesign --force --sign - --entitlements packaging/macos/ecrou.entitlements target/release/ecrou
+        codesign --force --sign - --entitlements packaging/homebrew/ecrou.entitlements target/release/ecrou
       `ecrou probe` reports this when the entitlement is missing.
     EOS
   end

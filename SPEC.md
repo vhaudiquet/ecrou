@@ -342,7 +342,7 @@ the release tarball and pushes it (gated on a `HOMEBREW_TAP_TOKEN`
 PAT; without the secret the job no-ops). The formula carries the runtime
 dependencies (`libkrun` from the krun tap, `e2fsprogs`, `libarchive`),
 builds from source with cargo, and re-signs the binary with the
-entitlements plist from `packaging/macos/` — brew bottles are
+entitlements plist from `packaging/homebrew/` — brew bottles are
 ad-hoc signed, so the signature is part of the formula's install,
 not of the artifact. The formula is pinned by tag until the first
 release exists, then switches to the release tarball + sha256 the

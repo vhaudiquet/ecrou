@@ -87,7 +87,7 @@ jobs:
         run: cargo build --release -p ecrou-cli
 
       - name: Sign the binary with the hypervisor entitlement
-        run: codesign --force --sign - --entitlements packaging/macos/ecrou.entitlements target/release/ecrou
+        run: codesign --force --sign - --entitlements packaging/homebrew/ecrou.entitlements target/release/ecrou
 
       - name: Package
         run: |
