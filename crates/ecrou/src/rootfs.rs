@@ -405,10 +405,8 @@ mod tests {
     use crate::progress::NoProgress;
 
     fn have_e2fsprogs() -> bool {
-        std::process::Command::new("mkfs.ext4")
-            .arg("-V")
-            .output()
-            .is_ok()
+        crate::utils::find_tool("mkfs.ext4").is_some()
+            && crate::utils::find_tool("debugfs").is_some()
     }
 
     #[test]
@@ -447,9 +445,10 @@ mod tests {
             .unwrap();
         tar.into_inner().unwrap().finish().unwrap();
 
-        let req = PrepareRequest::new(
+        let mut req = PrepareRequest::new(
             "ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         );
+        req.arch = "amd64".to_string();
         let pulled = cache.pull(&req, &NoProgress).unwrap();
         assert!(!pulled.downloaded);
         assert_eq!(pulled.cache_path, entry);
@@ -474,9 +473,10 @@ mod tests {
         // real pull flow.
         let dir = tempfile::tempdir().unwrap();
         let cache = RootfsCache::new(dir.path().to_path_buf());
-        let req = PrepareRequest::new(
+        let mut req = PrepareRequest::new(
             "ubuntu@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         );
+        req.arch = "amd64".to_string();
         // A pinned OCI source resolves without the network, so
         // parse_image_ref succeeds; the entry is absent, so pull takes
         // the download path and fails in fill_entry (no registry
@@ -502,7 +502,8 @@ mod tests {
         touch_entry(&cache, "alpine-3.23.0-x86_64.tar.gz");
         touch_entry(&cache, "alpine-3.22.9-x86_64.tar.gz");
 
-        let req = PrepareRequest::new("alpine:3.23");
+        let mut req = PrepareRequest::new("alpine:3.23");
+        req.arch = "amd64".to_string();
         let (source, path, downloaded) = cache.ensure_entry(&req, &NoProgress, false).unwrap();
         assert!(!downloaded);
         assert_eq!(path, dir.path().join("alpine-3.23.0-x86_64.tar.gz"));
@@ -519,7 +520,8 @@ mod tests {
         touch_entry(&cache, "alpine-3.20.3-x86_64.tar.gz");
         touch_entry(&cache, "alpine-3.23.0-x86_64.tar.gz");
 
-        let req = PrepareRequest::new("alpine:3.23");
+        let mut req = PrepareRequest::new("alpine:3.23");
+        req.arch = "amd64".to_string();
         let (_, path, _) = cache.ensure_entry(&req, &NoProgress, false).unwrap();
         assert_eq!(path, dir.path().join("alpine-3.23.0-x86_64.tar.gz"));
     }
@@ -531,13 +533,15 @@ mod tests {
         touch_entry(&cache, "alpine-20250401-x86_64.tar.gz");
         touch_entry(&cache, "alpine-3.23.0-x86_64.tar.gz");
 
-        let req = PrepareRequest::new("alpine:edge");
+        let mut req = PrepareRequest::new("alpine:edge");
+        req.arch = "amd64".to_string();
         let (_, path, _) = cache.ensure_entry(&req, &NoProgress, false).unwrap();
         assert_eq!(path, dir.path().join("alpine-20250401-x86_64.tar.gz"));
 
         // Plain "alpine" floats among releases; the edge date is
         // invisible to it.
-        let req = PrepareRequest::new("alpine");
+        let mut req = PrepareRequest::new("alpine");
+        req.arch = "amd64".to_string();
         let (_, path, _) = cache.ensure_entry(&req, &NoProgress, false).unwrap();
         assert_eq!(path, dir.path().join("alpine-3.23.0-x86_64.tar.gz"));
     }
@@ -549,7 +553,8 @@ mod tests {
         touch_entry(&cache, "ubuntu-24.04-amd64.tar.gz");
         touch_entry(&cache, "ubuntu-26.04-amd64.tar.gz");
 
-        let req = PrepareRequest::new("ubuntu:lts");
+        let mut req = PrepareRequest::new("ubuntu:lts");
+        req.arch = "amd64".to_string();
         let (source, _, _) = cache.ensure_entry(&req, &NoProgress, false).unwrap();
         let ImageSource::DirectTarball { version, .. } = source else {
             panic!("expected a direct tarball");
@@ -599,7 +604,8 @@ mod tests {
         // tree itself: the marker is read back out of the image.
         let image = rootfs.dir().join("rootfs.img");
         assert!(image.exists());
-        let out = std::process::Command::new("debugfs")
+        let debugfs = crate::utils::find_tool("debugfs").unwrap();
+        let out = std::process::Command::new(debugfs)
             .arg("-R")
             .arg("cat /etc-marker")
             .arg(&image)
