@@ -132,8 +132,7 @@ jobs:
           sha="$(cut -d' ' -f1 "dist/ecrou-v$v-darwin-arm64.tar.gz.sha256")"
           url="https://github.com/vhaudiquet/ecrou/archive/refs/tags/v$v.tar.gz"
           mkdir -p formula/Formula
-          sed -e 's|^  # Pinned by tag until the first release exists; switch to the$|  # Published by the ecrou release workflow; do not edit by hand.|'               -e '/^  # release tarball + sha256 then\.$/d'               -e "s|^  url \"https://github.com/vhaudiquet/ecrou.git\", tag: \"v0.1.0\"$|  url \"$url\"\n  sha256 \"$sha\"|" \
-            packaging/homebrew/Formula/ecrou.rb > formula/Formula/ecrou.rb
+          sed -e '/^  # Placeholder pin:/d' -e "s|^  url \"https://github.com/vhaudiquet/ecrou.git\", tag: \"v[0-9][0-9.]*\"$|  url \"$url\"\n  sha256 \"$sha\"|" packaging/homebrew/Formula/ecrou.rb > formula/Formula/ecrou.rb
           grep -q "sha256 \"$sha\"" formula/Formula/ecrou.rb
           git clone -q "https://x-access-token:$TAP_TOKEN@github.com/vhaudiquet/homebrew-ecrou" tap
           cp formula/Formula/ecrou.rb tap/Formula/ecrou.rb

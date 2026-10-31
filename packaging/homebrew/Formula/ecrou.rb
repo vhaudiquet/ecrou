@@ -5,8 +5,7 @@
 class Ecrou < Formula
   desc "a small microVM runtime based on libkrun"
   homepage "https://github.com/vhaudiquet/ecrou"
-  # Pinned by tag until the first release exists; switch to the
-  # release tarball + sha256 then.
+  # Placeholder pin: the release workflow rewrites url and sha256 on publish.
   url "https://github.com/vhaudiquet/ecrou.git", tag: "v0.1.0"
   license "MIT"
 
