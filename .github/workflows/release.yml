@@ -134,6 +134,15 @@ jobs:
           mkdir -p formula/Formula
           sed -e '/^  # Placeholder pin:/d' -e "s|^  url \"https://github.com/vhaudiquet/ecrou.git\", tag: \"v[0-9][0-9.]*\"$|  url \"$url\"\n  sha256 \"$sha\"|" packaging/homebrew/Formula/ecrou.rb > formula/Formula/ecrou.rb
           grep -q "sha256 \"$sha\"" formula/Formula/ecrou.rb
+          # A missing tap repo skips with a notice; a token that
+          # cannot clone an existing repo still fails the job.
+          code="$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $TAP_TOKEN" \
+            https://api.github.com/repos/vhaudiquet/homebrew-ecrou)"
+          if [[ "$code" != "200" ]]; then
+            echo "::notice::vhaudiquet/homebrew-ecrou unreachable (HTTP $code); tap not updated"
+            exit 0
+          fi
           git clone -q "https://x-access-token:$TAP_TOKEN@github.com/vhaudiquet/homebrew-ecrou" tap
           cp formula/Formula/ecrou.rb tap/Formula/ecrou.rb
           cd tap
