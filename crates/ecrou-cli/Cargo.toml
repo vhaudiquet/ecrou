@@ -12,6 +12,7 @@ name = "ecrou"
 path = "src/main.rs"
 
 [dependencies]
+libc = "0.2"
 ecrou = { path = "../ecrou" }
 
 # CLI parsing

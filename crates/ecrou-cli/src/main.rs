@@ -16,6 +16,7 @@ use cli::{parse_env, parse_volume, Cli, Command, RunArgs};
 use progress::TermProgress;
 
 fn main() -> std::process::ExitCode {
+    reexec_with_dyld_fallback();
     let cli = Cli::parse();
     logger::init(cli.verbose);
     match cli.command {
@@ -24,6 +25,67 @@ fn main() -> std::process::ExitCode {
         Command::Probe => cmd_probe(),
     }
 }
+
+/// The engine's dlopen of libkrunfw and mke2fs's dlopen of libarchive
+/// both name bare sonames, and dyld reads DYLD_FALLBACK_LIBRARY_PATH
+/// only once, at process startup — a setenv afterwards is invisible to
+/// it. When the variable is unset and the brew kegs exist, re-exec:
+/// exec restarts dyld, which reads the variable fresh. Library
+/// consumers instead set the variable themselves before their process
+/// starts (SPEC.md, macOS).
+#[cfg(target_os = "macos")]
+fn reexec_with_dyld_fallback() {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt};
+
+    if std::env::var_os("DYLD_FALLBACK_LIBRARY_PATH").is_some() {
+        return;
+    }
+    let dirs = match ecrou::utils::dyld_fallback_dirs() {
+        Some(dirs) => dirs,
+        None => return,
+    };
+    std::env::set_var("DYLD_FALLBACK_LIBRARY_PATH", &dirs);
+    let program = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(_) => return,
+    };
+    let mut argv: Vec<std::ffi::CString> = Vec::new();
+    let name = program
+        .file_name()
+        .map(|n| n.to_owned())
+        .unwrap_or_default();
+    argv.push(match std::ffi::CString::new(name.into_vec()) {
+        Ok(name) => name,
+        Err(_) => return,
+    });
+    let program = match std::ffi::CString::new(program.as_os_str().as_bytes()) {
+        Ok(program) => program,
+        Err(_) => return,
+    };
+    for arg in std::env::args_os().skip(1) {
+        match std::ffi::CString::new(arg.into_vec()) {
+            Ok(arg) => argv.push(arg),
+            // An argument with interior NULs cannot cross execv at
+            // all; the original process would have failed the same
+            // way, so bail out of the re-exec quietly.
+            Err(_) => return,
+        }
+    }
+    // Safety: execv replaces this process with itself, same program;
+    // on failure the process keeps running exactly as before.
+    // execv takes a C array of pointers into the strings, NUL-ended;
+    // the CStrings stay alive in `strings` across the call.
+    let mut pointers: Vec<*const libc::c_char> = argv.iter().map(|s| s.as_ptr().cast()).collect();
+    pointers.push(std::ptr::null());
+    // Safety: execv replaces this process with itself, same program;
+    // on failure the process keeps running exactly as before.
+    unsafe {
+        libc::execv(program.as_ptr().cast(), pointers.as_ptr());
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reexec_with_dyld_fallback() {}
 
 fn cmd_run(args: &RunArgs, cli_verbose: bool) -> std::process::ExitCode {
     // A tty drives the payload's output through the terminal while the
