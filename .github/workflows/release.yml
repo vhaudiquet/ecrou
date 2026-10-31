@@ -62,6 +62,45 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ steps.build.outputs.snap }}
 
+  # The macos distribution is a signed tarball, not a store release:
+  # brew taps install from it, and the entitlement signature rides in
+  # the artifact.
+  build-macos:
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Stamp the tag version into the manifests
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          sed -i '' "s/^version = \".*\"/version = \"$v\"/" Cargo.toml
+          grep -H '^version' Cargo.toml
+
+      - name: Build the CLI
+        run: cargo build --release -p ecrou-cli
+
+      - name: Sign the binary with the hypervisor entitlement
+        run: codesign --force --sign - --entitlements packaging/macos/ecrou.entitlements target/release/ecrou
+
+      - name: Package
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          tar -czf "ecrou-v$v-darwin-arm64.tar.gz" -C target/release ecrou
+          shasum -a 256 "ecrou-v$v-darwin-arm64.tar.gz" > "ecrou-v$v-darwin-arm64.tar.gz.sha256"
+          mkdir dist && mv ecrou-v$v-darwin-* dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ecrou-darwin-arm64
+          path: dist/*
+
   publish-snap:
     needs: build-snap
     runs-on: ubuntu-latest

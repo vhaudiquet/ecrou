@@ -38,6 +38,51 @@ jobs:
       - name: cargo test
         run: cargo test
 
+  macos:
+    name: macos — fmt, clippy, test, boot
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The engine is dlopen'd from the brew kegs at runtime; e2fsprogs
+      # supplies mke2fs and libarchive its tar path.
+      - name: Install the engine and the image tooling
+        run: brew install libkrun/homebrew-krun/libkrun e2fsprogs libarchive
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test
+
+      - name: Build the CLI
+        run: cargo build --release -p ecrou-cli
+
+      # HVF grants VM creation only to binaries carrying the hypervisor
+      # entitlement on current macOS; packaging signs the same way.
+      - name: Sign the binary with the hypervisor entitlement
+        run: codesign --force --sign - --entitlements packaging/macos/ecrou.entitlements target/release/ecrou
+
+      - name: Probe
+        run: ./target/release/ecrou probe
+
+      - name: Boot alpine
+        run: |
+          set -euo pipefail
+          guest="$(./target/release/ecrou run --quiet alpine -- uname -r | tail -n 1)"
+          echo "guest kernel: $guest"
+          test -n "$guest"
+
   t6:
     name: T6 strace audit
     runs-on: ubuntu-latest
