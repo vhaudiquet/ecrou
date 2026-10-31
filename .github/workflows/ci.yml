@@ -51,6 +51,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Homebrew refuses formulae from third-party taps until the tap
+      # is trusted once; libkrun's dependencies come from the krun tap.
+      - name: Trust the krun tap
+        run: brew trust --tap libkrun/krun
+
       # The engine is dlopen'd from the brew kegs at runtime; e2fsprogs
       # supplies mke2fs and libarchive its tar path.
       - name: Install the engine and the image tooling
