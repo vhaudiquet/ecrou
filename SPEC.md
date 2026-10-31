@@ -334,7 +334,12 @@ runner; the release workflow ships a signed darwin-arm64 tarball.
 ## Homebrew
 
 `packaging/homebrew/Formula/ecrou.rb` installs into a
-`vhaudiquet/homebrew-ecrou` tap. The formula carries the runtime
+`vhaudiquet/homebrew-ecrou` tap — the repo name is what makes
+`brew install vhaudiquet/ecrou/ecrou` resolve without an explicit
+`brew tap`. The tap repo is a publish target, not the source of
+truth: the release workflow rewrites the formula's url/sha256 for
+the release tarball and pushes it (gated on a `HOMEBREW_TAP_TOKEN`
+PAT; without the secret the job no-ops). The formula carries the runtime
 dependencies (`libkrun` from the krun tap, `e2fsprogs`, `libarchive`),
 builds from source with cargo, and re-signs the binary with the
 entitlements plist from `packaging/macos/` — brew bottles are

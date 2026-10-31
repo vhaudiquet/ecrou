@@ -101,6 +101,48 @@ jobs:
           name: ecrou-darwin-arm64
           path: dist/*
 
+  # The tap repo (vhaudiquet/homebrew-ecrou) is a publish target, not
+  # the source of truth: the formula is maintained in packaging/ and
+  # this job rewrites its url/sha256 for the release tarball and pushes
+  # it. Needs a PAT with push access to the tap repo as the
+  # HOMEBREW_TAP_TOKEN secret; without it the job is a no-op so tags
+  # still release.
+  update-homebrew:
+    needs: build-macos
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ecrou-darwin-arm64
+          path: dist
+
+      - name: Push the formula to the tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$TAP_TOKEN" ]]; then
+            echo "::notice::no HOMEBREW_TAP_TOKEN secret set; tap not updated"
+            exit 0
+          fi
+          v="${GITHUB_REF_NAME#v}"
+          sha="$(cut -d' ' -f1 "dist/ecrou-v$v-darwin-arm64.tar.gz.sha256")"
+          url="https://github.com/vhaudiquet/ecrou/archive/refs/tags/v$v.tar.gz"
+          mkdir -p formula/Formula
+          sed -e 's|^  # Pinned by tag until the first release exists; switch to the$|  # Published by the ecrou release workflow; do not edit by hand.|'               -e '/^  # release tarball + sha256 then\.$/d'               -e "s|^  url \"https://github.com/vhaudiquet/ecrou.git\", tag: \"v0.1.0\"$|  url \"$url\"\n  sha256 \"$sha\"|" \
+            packaging/homebrew/Formula/ecrou.rb > formula/Formula/ecrou.rb
+          grep -q "sha256 \"$sha\"" formula/Formula/ecrou.rb
+          git clone -q "https://x-access-token:$TAP_TOKEN@github.com/vhaudiquet/homebrew-ecrou" tap
+          cp formula/Formula/ecrou.rb tap/Formula/ecrou.rb
+          cd tap
+          git add Formula/ecrou.rb
+          git -c user.name="ecrou-release" -c user.email="noreply@github.com" \
+            commit -m "ecrou $v"
+          git push -q
+
   publish-snap:
     needs: build-snap
     runs-on: ubuntu-latest
