@@ -328,8 +328,12 @@ unpacks the rootfs to a tree and lets mke2fs populate from the
 directory — slower, and run states it in the log. The T6 strace audit
 and the `/dev/kvm` gating stay Linux-only: strace does not exist on
 macOS and the hypervisor gate is the entitlement probe instead. CI
-runs the whole gate plus a real `ecrou run` boot on a `macos-26`
-runner; the release workflow ships a signed darwin-arm64 tarball.
+runs the whole gate on a `macos-26` runner; hosted macOS runners
+expose no Hypervisor.framework, so the boot e2e is the Linux snap
+e2e and any real Mac — CI only asserts that the probe loads the
+engine from the krun tap and reports the HVF absence. The release
+workflow ships a signed darwin-arm64 tarball (build and sign only,
+no boot).
 
 ## Homebrew
 

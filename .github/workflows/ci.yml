@@ -39,7 +39,7 @@ jobs:
         run: cargo test
 
   macos:
-    name: macos — fmt, clippy, test, boot
+    name: macos — fmt, clippy, test, probe
     runs-on: macos-26
     timeout-minutes: 45
     steps:
@@ -78,15 +78,19 @@ jobs:
       - name: Sign the binary with the hypervisor entitlement
         run: codesign --force --sign - --entitlements packaging/homebrew/ecrou.entitlements target/release/ecrou
 
+      # GitHub's macOS runners expose no Hypervisor.framework (they run
+      # without nested virtualization), so nothing boots here — the
+      # boot e2e lives on Linux (the snap e2e) and on real Macs. The
+      # probe must still behave: the engine loads from the krun tap,
+      # the tools are found, and the HVF absence is reported as that.
       - name: Probe
-        run: ./target/release/ecrou probe
-
-      - name: Boot alpine
         run: |
           set -euo pipefail
-          guest="$(./target/release/ecrou run --quiet alpine -- uname -r | tail -n 1)"
-          echo "guest kernel: $guest"
-          test -n "$guest"
+          out="$(./target/release/ecrou probe || true)"
+          printf '%s\n' "$out"
+          grep -q "libkrun:      ok" <<<"$out"
+          grep -q "e2fsprogs:    ok" <<<"$out"
+          grep -q "no Hypervisor.framework support" <<<"$out"
 
   t6:
     name: T6 strace audit
