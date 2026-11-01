@@ -103,12 +103,37 @@ jobs:
 
   # The tap repo (vhaudiquet/homebrew-ecrou) is a publish target, not
   # the source of truth: the formula is maintained in packaging/ and
-  # this job rewrites its url/sha256 for the release tarball and pushes
-  # it. Needs a PAT with push access to the tap repo as the
+  # this job rewrites its url/sha256 for the release tarball (the
+  # binary publish-release just attached) and pushes it. Needs a PAT with push access to the tap repo as the
   # HOMEBREW_TAP_TOKEN secret; without it the job is a no-op so tags
   # still release.
-  update-homebrew:
+  # The Homebrew formula pours this tarball, so it has to be attached
+  # to the release before the tap update runs.
+  publish-release:
     needs: build-macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ecrou-darwin-arm64
+          path: dist
+
+      - name: Create the release and upload the tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#v}"
+          gh release create "v$v" --title "ecrou $v" --generate-notes || true
+          gh release upload "v$v" dist/* --clobber
+
+  update-homebrew:
+    needs: publish-release
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -130,7 +155,7 @@ jobs:
           fi
           v="${GITHUB_REF_NAME#v}"
           sha="$(cut -d' ' -f1 "dist/ecrou-v$v-darwin-arm64.tar.gz.sha256")"
-          url="https://github.com/vhaudiquet/ecrou/archive/refs/tags/v$v.tar.gz"
+          url="https://github.com/vhaudiquet/ecrou/releases/download/v$v/ecrou-v$v-darwin-arm64.tar.gz"
           mkdir -p formula/Formula
           sed -e '/^  # Placeholder pin:/d' -e "s|^  url \"https://github.com/vhaudiquet/ecrou.git\", tag: \"v[0-9][0-9.]*\"$|  url \"$url\"\n  sha256 \"$sha\"|" packaging/homebrew/Formula/ecrou.rb > formula/Formula/ecrou.rb
           grep -q "sha256 \"$sha\"" formula/Formula/ecrou.rb

@@ -340,7 +340,10 @@ no boot).
 `packaging/homebrew/Formula/ecrou.rb` installs into a
 `vhaudiquet/homebrew-ecrou` tap — the repo name is what makes
 `brew install vhaudiquet/ecrou/ecrou` resolve without an explicit
-`brew tap`. The tap repo is a publish target, not the source of
+`brew tap`. The formula pours the darwin tarball the release
+workflow signs and attaches to the GitHub release: no local compile,
+and the entitlement signature survives, which a rebuild here would
+strip. The tap repo is a publish target, not the source of
 truth: the release workflow rewrites the formula's url/sha256 for
 the release tarball and pushes it (gated on a `HOMEBREW_TAP_TOKEN`
 PAT; without the secret the job no-ops). The formula carries the runtime
@@ -349,8 +352,9 @@ builds from source with cargo, and re-signs the binary with the
 entitlements plist from `packaging/homebrew/` — brew bottles are
 ad-hoc signed, so the signature is part of the formula's install,
 not of the artifact. The in-repo formula's tag pin is a placeholder:
-the release workflow rewrites url and sha256 when it pushes the
-formula to the tap. Homebrew's tap-trust gate refuses dependencies
+the release workflow rewrites url and sha256 (of the release asset,
+not the source archive — they are different files) when it pushes
+the formula to the tap. Homebrew's tap-trust gate refuses dependencies
 from third-party taps until their tap is trusted, so the README
 leads with `brew trust --tap libkrun/krun` and CI trusts the tap
 before its install; removing that tax is another argument for

@@ -11,7 +11,6 @@ class Ecrou < Formula
 
   # libkrun's Hypervisor.framework backend is arm64-only upstream.
   depends_on arch: :arm64
-  depends_on "rust" => :build
   depends_on "libkrun/homebrew-krun/libkrun"
   depends_on "e2fsprogs"
   # A libarchive-capable mke2fs populates ext4 images from tarballs in
@@ -19,13 +18,11 @@ class Ecrou < Formula
   depends_on "libarchive"
 
   def install
-    system "cargo", "build", "--release"
-    bin.install "target/release/ecrou"
-    # Hypervisor.framework grants VM creation only to binaries signed
-    # with the hypervisor entitlement; on current macOS the signature
-    # is a hard requirement, the same one krunkit's formula carries.
-    system "codesign", "--force", "--sign", "-",
-      "--entitlements", "packaging/homebrew/ecrou.entitlements", bin/"ecrou"
+    # CI signed the binary with the hypervisor entitlement (a hard
+    # requirement on current macOS, the same one krunkit's formula
+    # signs for); a rebuild here would strip the signature, so the
+    # release tarball's binary is poured as-is.
+    bin.install "ecrou"
   end
 
   def caveats
