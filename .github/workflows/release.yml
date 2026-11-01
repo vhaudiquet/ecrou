@@ -144,12 +144,13 @@ jobs:
             exit 0
           fi
           git clone -q "https://x-access-token:$TAP_TOKEN@github.com/vhaudiquet/homebrew-ecrou" tap
+          mkdir -p tap/Formula
           cp formula/Formula/ecrou.rb tap/Formula/ecrou.rb
           cd tap
           git add Formula/ecrou.rb
           git -c user.name="ecrou-release" -c user.email="noreply@github.com" \
             commit -m "ecrou $v"
-          git push -q
+          git push -q origin HEAD:main
 
   publish-snap:
     needs: build-snap
